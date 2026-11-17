@@ -71,14 +71,8 @@ func (m model) viewProgress(applying bool) string {
 	b.WriteString("\n")
 
 	// active / recently finished tasks
-	maxRows := m.height - 8
-	if maxRows < 3 {
-		maxRows = 3
-	}
-	nameW := m.width - 24
-	if nameW < 20 {
-		nameW = 20
-	}
+	maxRows := max(m.height-8, 3)
+	nameW := max(m.width-24, 20)
 	shown := 0
 	hidden := 0
 	for _, addr := range m.order {
@@ -92,7 +86,7 @@ func (m model) viewProgress(applying bool) string {
 		}
 		shown++
 		name := shorten(addr, nameW)
-		glyph, gs := hookGlyph(t.action)
+		glyph, gs := actionGlyph(t.action)
 		g := gs.Render(glyph)
 		switch t.status {
 		case taskRunning:
@@ -128,15 +122,9 @@ func (m model) progressLine(elapsed time.Duration) string {
 		return stDim.Render("updating state…") // import/move only: terraform emits no per-resource events
 	}
 	total := m.total
-	if total == 0 {
-		total = 1
-	}
 	done := m.completed + m.failed
 	barW := 24
-	filled := done * barW / total
-	if filled > barW {
-		filled = barW
-	}
+	filled := min(done*barW/total, barW)
 	bar := stGreen.Render(strings.Repeat("█", filled)) + stDim.Render(strings.Repeat("░", barW-filled))
 
 	pct := done * 100 / total
@@ -178,15 +166,15 @@ func (m model) viewFailures(nameW int) string {
 	return b.String()
 }
 
-func (m model) viewDiags(max int) string {
+func (m model) viewDiags(n int) string {
 	if len(m.diags) == 0 {
 		return ""
 	}
 	var b strings.Builder
 	b.WriteString("\n")
 	start := 0
-	if len(m.diags) > max {
-		start = len(m.diags) - max
+	if len(m.diags) > n {
+		start = len(m.diags) - n
 		b.WriteString(" " + stDim.Render(fmt.Sprintf("(%d earlier diagnostics)", start)) + "\n")
 	}
 	for _, d := range m.diags[start:] {
@@ -197,33 +185,30 @@ func (m model) viewDiags(max int) string {
 	return b.String()
 }
 
-// renderDiagLines formats a diagnostic. wrap=true word-wraps the detail (for
-// the recap printed after the TUI exits, where nothing may be cut off);
-// otherwise lines are truncated to fit the fixed-height screen.
-func renderDiagLines(d *Diagnostic, width int, wrap bool) []string {
+// renderDiagLines formats a diagnostic. full=true keeps every line whole (for
+// the recap printed after the TUI exits, where nothing may be cut off and the
+// terminal wraps); otherwise lines are truncated to fit the fixed-height screen.
+func renderDiagLines(d *Diagnostic, width int, full bool) []string {
 	mark := stRedBold.Render("✗ Error:")
 	body := stRed
 	if d.Severity == "warning" {
 		mark = stYellow.Render("⚠ Warning:")
 		body = stYellow
 	}
-	head := mark + " " + body.Render(d.Summary)
+	head := mark + " " + body.Render(clean(d.Summary))
 	if d.Address != "" {
-		head += stDim.Render("  [" + d.Address + "]")
+		head += stDim.Render("  [" + clean(d.Address) + "]")
 	}
 	if d.Range != nil && d.Range.Filename != "" {
-		head += stDim.Render(fmt.Sprintf("  %s:%d", d.Range.Filename, d.Range.Start.Line))
+		head += stDim.Render(fmt.Sprintf("  %s:%d", clean(d.Range.Filename), d.Range.Start.Line))
 	}
 	lines := []string{head}
 	if d.Detail != "" {
-		for _, dl := range strings.Split(strings.TrimSpace(d.Detail), "\n") {
-			if !wrap {
-				lines = append(lines, "    "+stDim.Render(truncRunes(dl, width-6)))
-				continue
+		for _, dl := range strings.Split(strings.TrimSpace(clean(d.Detail)), "\n") {
+			if !full {
+				dl = truncRunes(dl, width-6)
 			}
-			for _, wl := range wrapWords(dl, width-6) {
-				lines = append(lines, "    "+stDim.Render(wl))
-			}
+			lines = append(lines, "    "+stDim.Render(dl))
 		}
 	}
 	return lines
@@ -243,7 +228,7 @@ func (m model) viewReview() string {
 	if m.cfg.sub == "destroy" {
 		title = "Destroy plan"
 	}
-	if m.refreshOnly() {
+	if m.cfg.o.refreshOnly {
 		title = "Refresh-only plan"
 	}
 	parts := []string{}
@@ -283,10 +268,7 @@ func (m model) viewReview() string {
 	b.WriteString("\n" + header + "\n " + stDim.Render(strings.Repeat("─", max(m.width-2, 1))) + "\n")
 
 	h := m.bodyHeight()
-	end := m.offset + h
-	if end > len(m.rows) {
-		end = len(m.rows)
-	}
+	end := min(m.offset+h, len(m.rows))
 	for i := m.offset; i < end; i++ {
 		b.WriteString(m.renderRow(i) + "\n")
 	}
@@ -318,10 +300,7 @@ func (m model) viewReview() string {
 
 func (m model) renderRow(i int) string {
 	r := m.rows[i]
-	w := m.width - 6
-	if w < 20 {
-		w = 20
-	}
+	w := max(m.width-6, 20)
 	cursorMark := "  "
 	isCursor := i == m.cursor
 	if isCursor {
@@ -421,8 +400,8 @@ func (m model) viewPrompt() string {
 	var b strings.Builder
 	b.WriteString("\n " + stCyan.Render("?") + " " + stBold.Render(title) + "\n")
 	b.WriteString("   " + stBold.Render("var."+v.name))
-	if v.where != "" {
-		b.WriteString("  " + stDim.Render(v.where))
+	if w := v.where(); w != "" {
+		b.WriteString("  " + stDim.Render(w))
 	}
 	b.WriteString("\n\n   " + stCyan.Render("›") + " " + shown + stCyan.Render("▏") + "\n")
 	b.WriteString("   " + stDim.Render(help) + "\n\n")

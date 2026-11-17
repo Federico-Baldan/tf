@@ -4,21 +4,20 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // shorten compresses a resource address to fit max display cells:
 // module. → m., then middle-ellipsis if still too long.
-func shorten(addr string, max int) string {
-	if max < 8 {
-		max = 8
-	}
-	s := strings.ReplaceAll(addr, "module.", "m.")
+func shorten(addr string, n int) string {
+	n = max(n, 8)
+	s := strings.ReplaceAll(clean(addr), "module.", "m.")
 	r := []rune(s)
-	if len(r) <= max {
+	if len(r) <= n {
 		return s
 	}
-	head := max / 3
-	tail := max - head - 1
+	head := n / 3
+	tail := n - head - 1
 	return string(r[:head]) + "…" + string(r[len(r)-tail:])
 }
 
@@ -33,38 +32,27 @@ func fmtDur(d time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
-func truncRunes(s string, max int) string {
-	if max <= 0 {
+func truncRunes(s string, n int) string {
+	if n <= 0 {
 		return ""
 	}
 	r := []rune(s)
-	if len(r) <= max {
+	if len(r) <= n {
 		return s
 	}
-	return string(r[:max-1]) + "…"
+	return string(r[:n-1]) + "…"
 }
 
-// wrapWords wraps one line at word boundaries to w cells, keeping its
-// leading indentation on continuation lines.
-func wrapWords(s string, w int) []string {
-	if w < 20 {
-		w = 20
-	}
-	indent := s[:len(s)-len(strings.TrimLeft(s, " \t"))]
-	line := indent
-	var out []string
-	for _, word := range strings.Fields(s) {
-		if strings.TrimSpace(line) != "" {
-			if len([]rune(line))+1+len([]rune(word)) > w {
-				out = append(out, line)
-				line = indent + word
-				continue
-			}
-			line += " "
+// clean replaces control characters (including ESC and the C1 range) with
+// U+FFFD. Names, ids and messages come from configs and providers; printed
+// raw they could move the cursor, clear the screen or retitle the window.
+func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) && r != '\n' {
+			return '\uFFFD'
 		}
-		line += word
-	}
-	return append(out, line)
+		return r
+	}, s)
 }
 
 func plural(n int, word string) string {

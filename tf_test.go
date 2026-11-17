@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // planFixture mirrors real `terraform show -json` output for each kind of
@@ -92,8 +94,8 @@ func TestUnsetVars(t *testing.T) {
 	if len(got) != 2 || got[0].name != "env" || got[1].name != "zones" {
 		t.Fatalf("got %+v", got)
 	}
-	if got[0].where != "variables.tf:0" {
-		t.Errorf("where %q", got[0].where)
+	if got[0].where() != "variables.tf:0" {
+		t.Errorf("where %q", got[0].where())
 	}
 
 	// any other error means prompting can't fix it
@@ -212,25 +214,6 @@ func TestRenderVal(t *testing.T) {
 	}
 }
 
-func TestWrapWords(t *testing.T) {
-	in := "  - provider registry.terraform.io/hashicorp/local: required by this configuration but no version is selected"
-	lines := wrapWords(in, 40)
-	if len(lines) < 3 {
-		t.Fatalf("not wrapped: %q", lines)
-	}
-	for _, l := range lines {
-		if !strings.HasPrefix(l, "  ") || len([]rune(l)) > 40 {
-			t.Errorf("bad line %q", l)
-		}
-	}
-	if strings.Join(strings.Fields(strings.Join(lines, " ")), " ") != strings.Join(strings.Fields(in), " ") {
-		t.Errorf("words changed: %q", lines)
-	}
-	if got := wrapWords("", 40); len(got) != 1 || got[0] != "" {
-		t.Errorf("empty line: %q", got)
-	}
-}
-
 // -refresh-only plans have drift but no resource changes
 func TestDriftedRefreshOnly(t *testing.T) {
 	var p Plan
@@ -341,5 +324,115 @@ func TestStartErrShown(t *testing.T) {
 	m.appendStartErr(os.ErrNotExist)
 	if len(m.final) != 0 {
 		t.Error("must not add noise when terraform produced diagnostics")
+	}
+}
+
+// keys with dots must not be taken for nesting: "app" being unknown must not
+// hide a change to "app.kubernetes.io/name"
+func TestDottedKeys(t *testing.T) {
+	got := diffOf(t, `{"actions":["update"],
+		"before":{"labels":{"app":"a","app.kubernetes.io/name":"old"}},
+		"after":{"labels":{"app.kubernetes.io/name":"new"}},
+		"after_unknown":{"labels":{"app":true}}}`)
+	if len(got) != 2 ||
+		got[0].key != "labels.app" || got[0].new != "(known after apply)" ||
+		got[1].key != "labels.app.kubernetes.io/name" || got[1].old != `"old"` || got[1].new != `"new"` {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+// a sensitive flag on the root covers everything below it
+func TestRootSensitive(t *testing.T) {
+	for _, l := range diffOf(t, `{"actions":["update"],"before":{"a":"OLDSECRET"},"after":{"a":"NEWSECRET"},
+		"before_sensitive":true,"after_sensitive":true}`) {
+		if strings.Contains(l.old+l.new, "SECRET") {
+			t.Errorf("leaked: %+v", l)
+		}
+	}
+}
+
+// replace_paths steps map onto the same path form as the diff keys
+func TestForcesReplacementPath(t *testing.T) {
+	got := diffOf(t, `{"actions":["delete","create"],
+		"before":{"tags":{"a.b":"x"},"l":[{"n":1}]},"after":{"tags":{"a.b":"y"},"l":[{"n":2}]},
+		"replace_paths":[["tags","a.b"],["l",0,"n"]]}`)
+	if len(got) != 2 || !got[0].forces || !got[1].forces || got[1].key != "tags.a.b" {
+		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestClean(t *testing.T) {
+	if got := clean("a\x1b]0;PWNED\x07b\u009bc"); strings.ContainsAny(got, "\x1b\x07\u009b") || !strings.Contains(got, "PWNED") {
+		t.Errorf("got %q", got)
+	}
+	if clean("ok\nline") != "ok\nline" {
+		t.Error("newlines must survive (diagnostics are split on them)")
+	}
+	// JSON already escapes ESC; DEL and the C1 range (U+009B is CSI to some terminals) it does not
+	if got := renderVal("k\x1b[31m\u009b31m\x7f"); strings.ContainsAny(got, "\x1b\u009b\x7f") {
+		t.Errorf("value not sanitised: %q", got)
+	}
+}
+
+func TestDeclinedExitCodes(t *testing.T) {
+	for _, tc := range []struct {
+		sub  string
+		want int
+	}{{"apply", 1}, {"destroy", 1}, {"plan", 0}} {
+		m := model{stage: stageReview, cfg: config{sub: tc.sub}, plan: &Plan{}}
+		next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+		if got := next.(model).exitCode; got != tc.want {
+			t.Errorf("%s: q exits %d, want %d", tc.sub, got, tc.want)
+		}
+	}
+}
+
+// the confirm prompt needs an explicit y; enter must not apply
+func TestEnterDoesNotConfirm(t *testing.T) {
+	m := model{stage: stageReview, confirm: true, cfg: config{sub: "apply"}, plan: &Plan{}}
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if got := next.(model); got.stage != stageReview || got.confirm {
+		t.Errorf("enter changed stage to %v (confirm=%v)", got.stage, got.confirm)
+	}
+}
+
+// a plan that ends normally after we asked it to stop is still an interrupted run
+func TestInterruptedPlanThatFinishes(t *testing.T) {
+	m := model{stage: stagePlanning, interrupted: true, cfg: config{sub: "apply"}}
+	next, cmd := m.handleExit(exitMsg{phase: "plan", code: 0})
+	got := next.(model)
+	if got.exitCode != 1 || !got.quitting || cmd == nil {
+		t.Errorf("exit=%d quitting=%v", got.exitCode, got.quitting)
+	}
+}
+
+// prompts follow declaration order, not terraform's random report order
+func TestUnsetVarsDeclarationOrder(t *testing.T) {
+	mk := func(name string, line int) *Diagnostic {
+		return &Diagnostic{
+			Severity: "error", Summary: "No value for required variable",
+			Detail: `The root module input variable "` + name + `" is not set, and has no default value.`,
+			Range: &DiagRange{Filename: "variables.tf", Start: struct {
+				Line int `json:"line"`
+			}{line}},
+		}
+	}
+	m := model{diags: []*Diagnostic{mk("c", 30), mk("a", 2), mk("b", 10)}}
+	var names []string
+	for _, v := range m.unsetVars() {
+		names = append(names, v.name)
+	}
+	if !reflect.DeepEqual(names, []string{"a", "b", "c"}) {
+		t.Errorf("order %v", names)
+	}
+}
+
+func TestStateFlagsReachApply(t *testing.T) {
+	o := parseArgs("apply", []string{"-state=a.tfstate", "-state-out", "b.tfstate", "-backup=c", "-input=false", "-refresh-only"})
+	if want := []string{"-state=a.tfstate", "-state-out", "b.tfstate", "-backup=c"}; !reflect.DeepEqual(o.shared, want) {
+		t.Errorf("shared %v, want %v", o.shared, want)
+	}
+	if !o.noInput || !o.refreshOnly {
+		t.Errorf("noInput=%v refreshOnly=%v", o.noInput, o.refreshOnly)
 	}
 }

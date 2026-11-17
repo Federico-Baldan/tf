@@ -3,7 +3,6 @@ package main
 import "strings"
 
 type opts struct {
-	sub         string
 	globals     []string // args before the subcommand (e.g. -chdir=...)
 	varEnv      []string // -var values as TF_VAR_* entries, replayed at apply (ephemeral variables need them there too)
 	planArgs    []string // flags passed to the plan step
@@ -11,6 +10,8 @@ type opts struct {
 	autoApprove bool
 	planOut     string // user-supplied -out path (we keep the file)
 	planFileArg string // positional plan file given to `apply`
+	refreshOnly bool
+	noInput     bool // -input=false: never prompt for variables
 }
 
 // flags that take a value (possibly space-separated)
@@ -24,6 +25,8 @@ var valueFlags = map[string]bool{
 // flags that should also be passed to the apply-plan-file step
 var sharedFlags = map[string]bool{
 	"-parallelism": true, "-lock": true, "-lock-timeout": true,
+	// a saved plan must be applied against the same state files it was made from
+	"-state": true, "-state-out": true, "-backup": true,
 }
 
 // flags we manage ourselves and must strip from user args
@@ -33,7 +36,7 @@ var strippedFlags = map[string]bool{
 }
 
 func parseArgs(sub string, rest []string) opts {
-	o := opts{sub: sub}
+	var o opts
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
 		if !strings.HasPrefix(a, "-") {
@@ -42,12 +45,7 @@ func parseArgs(sub string, rest []string) opts {
 			}
 			continue
 		}
-		name := a
-		val := ""
-		hasEq := false
-		if j := strings.Index(a, "="); j >= 0 {
-			name, val, hasEq = a[:j], a[j+1:], true
-		}
+		name, val, hasEq := strings.Cut(a, "=")
 		name = "-" + strings.TrimLeft(name, "-")
 
 		tokens := []string{a}
@@ -57,17 +55,20 @@ func parseArgs(sub string, rest []string) opts {
 			tokens = append(tokens, val)
 		}
 
-		if name == "-var" {
+		switch {
+		case name == "-var":
 			if k, v, ok := strings.Cut(val, "="); ok {
 				o.varEnv = append(o.varEnv, "TF_VAR_"+k+"="+v)
 			}
+		case name == "-refresh-only":
+			o.refreshOnly = true
+		case name == "-input" && val == "false":
+			o.noInput = true
 		}
 
 		switch {
 		case name == "-auto-approve":
 			o.autoApprove = true
-		case name == "-destroy" && sub == "plan":
-			o.planArgs = append(o.planArgs, a)
 		case name == "-out":
 			o.planOut = val
 		case strippedFlags[name]:

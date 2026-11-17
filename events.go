@@ -4,8 +4,6 @@ import "encoding/json"
 
 // Event is one line of terraform's machine-readable UI output (-json).
 type Event struct {
-	Level      string                 `json:"@level"`
-	Message    string                 `json:"@message"`
 	Type       string                 `json:"type"`
 	Hook       *Hook                  `json:"hook"`
 	Diagnostic *Diagnostic            `json:"diagnostic"`
@@ -16,17 +14,11 @@ type Event struct {
 type Hook struct {
 	Resource       *HookResource `json:"resource"`
 	Action         string        `json:"action"`
-	IDKey          string        `json:"id_key"`
-	IDValue        any           `json:"id_value"`
 	ElapsedSeconds float64       `json:"elapsed_seconds"`
-	Provisioner    string        `json:"provisioner"`
 }
 
 type HookResource struct {
-	Addr         string `json:"addr"`
-	Module       string `json:"module"`
-	ResourceType string `json:"resource_type"`
-	ResourceName string `json:"resource_name"`
+	Addr string `json:"addr"`
 }
 
 type Diagnostic struct {
@@ -49,15 +41,13 @@ type ChangeSummary struct {
 	Change int `json:"change"`
 	Import int `json:"import"`
 	// actions run during apply
-	ActionInvocation int    `json:"action_invocation"`
-	Remove           int    `json:"remove"`
-	Operation        string `json:"operation"`
+	ActionInvocation int `json:"action_invocation"`
+	Remove           int `json:"remove"`
 }
 
 type OutputMeta struct {
 	Sensitive bool            `json:"sensitive"`
 	Value     json.RawMessage `json:"value"`
-	Action    string          `json:"action"`
 }
 
 func parseEvent(line []byte) *Event {

@@ -29,7 +29,7 @@ func actionGlyph(action string) (string, lipgloss.Style) {
 		return "-", stRed
 	case actReplace:
 		return "±", stMagenta
-	case actRead:
+	case actRead, "refresh":
 		return "↻", stCyan
 	case actImport:
 		return "↓", stCyan
@@ -47,21 +47,4 @@ func actionGlyph(action string) (string, lipgloss.Style) {
 // hint renders a key legend entry: bold key, dim label.
 func hint(key, label string) string {
 	return stBold.Render(key) + " " + stDim.Render(label)
-}
-
-func hookGlyph(hookAction string) (string, lipgloss.Style) {
-	switch hookAction {
-	case "create":
-		return "+", stGreen
-	case "update":
-		return "~", stYellow
-	case "delete":
-		return "-", stRed
-	case "replace":
-		return "±", stMagenta
-	case "read", "refresh":
-		return "↻", stCyan
-	default:
-		return "·", stDim
-	}
 }

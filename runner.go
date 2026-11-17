@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -45,14 +46,6 @@ func (p *procHolder) signal(sig os.Signal) {
 	defer p.mu.Unlock()
 	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Signal(sig)
-	}
-}
-
-func (p *procHolder) kill() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cmd != nil && p.cmd.Process != nil {
-		_ = p.cmd.Process.Kill()
 	}
 }
 
@@ -100,8 +93,7 @@ func startTF(bin string, args []string, phase string, env []string, ch chan tea.
 		if code != 0 {
 			if s := strings.TrimSpace(stderr.String()); s != "" {
 				ch <- evMsg{&Event{
-					Level: "error",
-					Type:  "diagnostic",
+					Type: "diagnostic",
 					Diagnostic: &Diagnostic{
 						Severity: "error",
 						Summary:  "terraform exited with an error",
@@ -126,7 +118,7 @@ func runShowCmd(bin string, globals []string, planPath string) tea.Cmd {
 			if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
 				detail = string(ee.Stderr)
 			}
-			return showMsg{err: &showError{detail}}
+			return showMsg{err: errors.New(detail)}
 		}
 		var p Plan
 		if err := json.Unmarshal(out, &p); err != nil {
@@ -135,10 +127,6 @@ func runShowCmd(bin string, globals []string, planPath string) tea.Cmd {
 		return showMsg{plan: &p}
 	}
 }
-
-type showError struct{ s string }
-
-func (e *showError) Error() string { return e.s }
 
 func waitFor(ch chan tea.Msg) tea.Cmd {
 	return func() tea.Msg { return <-ch }

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -37,7 +38,8 @@ func main() {
 	}
 
 	interactive := term.IsTerminal(int(os.Stdout.Fd())) && term.IsTerminal(int(os.Stdin.Fd()))
-	if subIdx == -1 || !interactive {
+	help := slices.ContainsFunc(args, func(a string) bool { return a == "-h" || a == "-help" || a == "--help" })
+	if subIdx == -1 || !interactive || help {
 		passthrough(tfBin, args)
 	}
 
@@ -70,24 +72,22 @@ func main() {
 		}
 		cfg.tmpDir = dir
 		cfg.planPath = filepath.Join(dir, "plan.tfplan")
-		// closing the terminal sends SIGHUP, which skips the normal cleanup
-		hup := make(chan os.Signal, 1)
-		signal.Notify(hup, syscall.SIGHUP)
-		go func() {
-			<-hup
-			_ = os.RemoveAll(dir)
-			os.Exit(129)
-		}()
 	}
 
 	m := newModel(cfg)
-	// route SIGINT/SIGTERM through the same path as ctrl+c, so terraform is
-	// stopped gracefully instead of being orphaned when tf exits
 	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithoutSignalHandler())
 	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
-		for range stop {
+		for s := range stop {
+			if s == syscall.SIGHUP {
+				// terminal closed: no time for a graceful stop, but don't leave
+				// the plan file (it holds secrets) behind
+				_ = os.RemoveAll(cfg.tmpDir)
+				os.Exit(129)
+			}
+			// SIGINT/SIGTERM take the ctrl+c path, so terraform is stopped
+			// gracefully instead of being orphaned when tf exits
 			p.Send(tea.KeyMsg{Type: tea.KeyCtrlC})
 		}
 	}()

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,7 +38,6 @@ const (
 )
 
 type task struct {
-	addr    string
 	action  string // hook action: create/update/delete/read/refresh/...
 	status  taskStatus
 	start   time.Time
@@ -76,23 +77,27 @@ const (
 )
 
 type row struct {
-	kind    rowKind
-	text    string
-	note    string // dim suffix on node rows: reason, import id, previous address
-	nodeIdx int
-	sym     byte   // for detail rows
-	action  string // for node and section rows
-	forces  bool
-	// attribute detail rows (empty key = free-form text)
-	key, old, new string
-	keyW          int // key column width shared by the node's rows
+	kind     rowKind
+	note     string // dim suffix on node rows: reason, import id, previous address
+	nodeIdx  int
+	action   string // for node and section rows
+	keyW     int    // key column width shared by the node's rows
+	diffLine        // text for section/node rows; sym/key/old/new for details
 }
 
 // pendingVar is a required variable terraform reported as unset.
 type pendingVar struct {
 	name      string
-	where     string // file:line of the declaration
-	sensitive bool   // declared sensitive = true
+	file      string // where it is declared
+	line      int
+	sensitive bool // declared sensitive = true
+}
+
+func (v pendingVar) where() string {
+	if v.file == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", clean(v.file), v.line)
 }
 
 type model struct {
@@ -136,7 +141,6 @@ type model struct {
 
 	// lifecycle
 	interrupted bool
-	applied     bool
 	quitting    bool
 	exitCode    int
 	final       []string // recap printed after the TUI exits
@@ -251,9 +255,7 @@ func (m *model) handleEvent(ev *Event) {
 	case ev.Type == "planned_change":
 		m.plannedSeen++
 	case ev.Type == "outputs":
-		for k, v := range ev.Outputs {
-			m.outputs[k] = v
-		}
+		maps.Copy(m.outputs, ev.Outputs)
 	case ev.Hook != nil && ev.Hook.Resource != nil:
 		addr := ev.Hook.Resource.Addr
 		switch {
@@ -275,7 +277,7 @@ func (m *model) handleEvent(ev *Event) {
 			if _, ok := m.tasks[addr]; !ok {
 				m.order = append(m.order, addr)
 			}
-			m.tasks[addr] = &task{addr: addr, action: action, status: taskRunning, start: time.Now()}
+			m.tasks[addr] = &task{action: action, status: taskRunning, start: time.Now()}
 		case strings.HasSuffix(ev.Type, "_complete"):
 			if strings.HasPrefix(ev.Type, "provision") {
 				if t, ok := m.tasks[addr]; ok {
@@ -301,7 +303,7 @@ func (m *model) handleEvent(ev *Event) {
 				t.elapsed = ev.Hook.ElapsedSeconds
 			} else {
 				m.order = append(m.order, addr)
-				m.tasks[addr] = &task{addr: addr, action: ev.Hook.Action, status: taskFailed, start: time.Now(), doneAt: time.Now()}
+				m.tasks[addr] = &task{action: ev.Hook.Action, status: taskFailed, start: time.Now(), doneAt: time.Now()}
 			}
 			if m.stage == stageApplying && ev.Type == "apply_errored" {
 				m.failed++ // provision_errored is followed by apply_errored for the same resource
@@ -327,8 +329,8 @@ func (m *model) reapTasks() {
 func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 	switch msg.phase {
 	case "plan":
-		if msg.code != 0 {
-			if q := m.unsetVars(); !m.interrupted && len(q) > 0 {
+		if msg.code != 0 || m.interrupted {
+			if q := m.unsetVars(); !m.interrupted && !m.cfg.o.noInput && len(q) > 0 {
 				m.queue, m.input, m.stage = q, "", stagePrompt
 				return m, nil
 			}
@@ -359,7 +361,6 @@ func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 				m.final = append(m.final, stRedBold.Render(fmt.Sprintf("✗ Apply failed after %s. %d completed, %d failed.", fmtDur(elapsed), m.completed, m.failed)))
 			}
 		} else {
-			m.applied = true
 			if m.cfg.sub == "destroy" {
 				n := m.completed
 				if s := m.summary; s != nil {
@@ -368,14 +369,14 @@ func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 				m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Destroy complete in %s — %s destroyed.", fmtDur(elapsed), plural(n, "resource"))))
 			} else {
 				if s := m.summary; s != nil {
-					imported := ""
+					extra := ""
 					if s.Import > 0 {
-						imported = fmt.Sprintf(", %d imported", s.Import)
+						extra = fmt.Sprintf(", %d imported", s.Import)
 					}
 					if s.ActionInvocation > 0 {
-						imported += fmt.Sprintf(", %d invoked", s.ActionInvocation)
+						extra += fmt.Sprintf(", %d invoked", s.ActionInvocation)
 					}
-					m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Apply complete in %s — %d added, %d changed, %d destroyed%s.", fmtDur(elapsed), s.Add, s.Change, s.Remove, imported)))
+					m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Apply complete in %s — %d added, %d changed, %d destroyed%s.", fmtDur(elapsed), s.Add, s.Change, s.Remove, extra)))
 				} else {
 					m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Apply complete in %s — %s.", fmtDur(elapsed), plural(m.completed, "resource"))))
 				}
@@ -394,14 +395,14 @@ func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 func (m *model) appendStartErr(err error) {
 	var ee *exec.ExitError
 	if err != nil && len(m.diags) == 0 && !errors.As(err, &ee) {
-		m.final = append(m.final, stRed.Render(err.Error()))
+		m.final = append(m.final, stRed.Render(clean(err.Error())))
 	}
 }
 
 func (m model) handleShow(msg showMsg) (tea.Model, tea.Cmd) {
 	if msg.err != nil {
 		m.exitCode = 1
-		m.final = append(m.final, stRedBold.Render("✗ Failed to read plan: "+msg.err.Error()))
+		m.final = append(m.final, stRedBold.Render("✗ Failed to read plan: "+clean(msg.err.Error())))
 		m.quitting = true
 		m.stage = stageDone
 		return m, tea.Quit
@@ -459,9 +460,9 @@ func (m *model) buildTree() {
 			detail = nil // the resource stays; red "-" lines would read as a delete
 		}
 		m.nodes = append(m.nodes, &node{
-			addr:   rc.Address,
+			addr:   clean(rc.Address),
 			action: action,
-			reason: noteOf(rc, action),
+			reason: clean(noteOf(rc, action)),
 			detail: detail,
 		})
 	}
@@ -483,28 +484,14 @@ func (m *model) buildTree() {
 	m.rebuildRows()
 }
 
+var sectionLabel = map[string]string{
+	actCreate: "＋ create", actUpdate: "～ update", actReplace: "± replace",
+	actDelete: "－ destroy", actRead: "↻ read", actImport: "↓ import",
+	actForget: "⊘ forget — leaves state, resource kept", actMove: "→ move", actInvoke: "▶ invoke",
+}
+
 func sectionTitle(action string, n int) string {
-	switch action {
-	case actCreate:
-		return fmt.Sprintf("＋ create (%d)", n)
-	case actUpdate:
-		return fmt.Sprintf("～ update (%d)", n)
-	case actReplace:
-		return fmt.Sprintf("± replace (%d)", n)
-	case actDelete:
-		return fmt.Sprintf("－ destroy (%d)", n)
-	case actRead:
-		return fmt.Sprintf("↻ read (%d)", n)
-	case actImport:
-		return fmt.Sprintf("↓ import (%d)", n)
-	case actForget:
-		return fmt.Sprintf("⊘ forget — leaves state, resource kept (%d)", n)
-	case actMove:
-		return fmt.Sprintf("→ move (%d)", n)
-	case actInvoke:
-		return fmt.Sprintf("▶ invoke (%d)", n)
-	}
-	return action
+	return fmt.Sprintf("%s (%d)", sectionLabel[action], n)
 }
 
 // noteOf says why a node is listed: replace/delete reason, import id,
@@ -539,10 +526,7 @@ func keyWidth(lines []diffLine) int {
 			w = n
 		}
 	}
-	if w > 32 {
-		w = 32
-	}
-	return w
+	return min(w, 32)
 }
 
 func (m *model) rebuildRows() {
@@ -557,30 +541,30 @@ func (m *model) rebuildRows() {
 			if last != "" {
 				m.rows = append(m.rows, row{kind: rowBlank})
 			}
-			m.rows = append(m.rows, row{kind: rowSection, text: sectionTitle(n.action, counts[n.action]), nodeIdx: -1, action: n.action})
+			m.rows = append(m.rows, row{kind: rowSection, diffLine: diffLine{text: sectionTitle(n.action, counts[n.action])}, nodeIdx: -1, action: n.action})
 			last = n.action
 		}
 		caret := "▸"
 		if n.expanded {
 			caret = "▾"
 		}
-		m.rows = append(m.rows, row{kind: rowNode, text: caret + " " + n.addr, note: n.reason, nodeIdx: i, action: n.action})
+		m.rows = append(m.rows, row{kind: rowNode, diffLine: diffLine{text: caret + " " + n.addr}, note: n.reason, nodeIdx: i, action: n.action})
 		if n.expanded {
 			if len(n.detail) == 0 {
-				m.rows = append(m.rows, row{kind: rowDetail, text: "(no attribute changes)", nodeIdx: i, sym: ' '})
+				m.rows = append(m.rows, row{kind: rowDetail, diffLine: diffLine{text: "(no attribute changes)", sym: ' '}, nodeIdx: i})
 			}
 			kw := keyWidth(n.detail)
 			for _, d := range n.detail {
-				m.rows = append(m.rows, row{kind: rowDetail, text: d.text, key: d.key, old: d.old, new: d.new, keyW: kw, nodeIdx: i, sym: d.sym, forces: d.forces})
+				m.rows = append(m.rows, row{kind: rowDetail, diffLine: d, keyW: kw, nodeIdx: i})
 			}
 		}
 	}
 
 	// actions to run
 	if n := len(m.plan.ActionInvocations); n > 0 {
-		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: sectionTitle(actInvoke, n), nodeIdx: -1, action: actInvoke})
+		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, diffLine: diffLine{text: sectionTitle(actInvoke, n)}, nodeIdx: -1, action: actInvoke})
 		for _, ai := range m.plan.ActionInvocations {
-			m.rows = append(m.rows, row{kind: rowDetail, text: ai.Address, nodeIdx: -1, sym: ' '})
+			m.rows = append(m.rows, row{kind: rowDetail, diffLine: diffLine{text: clean(ai.Address), sym: ' '}, nodeIdx: -1})
 		}
 	}
 
@@ -594,16 +578,8 @@ func (m *model) rebuildRows() {
 		}
 		if len(names) > 0 {
 			sort.Strings(names)
-			m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: fmt.Sprintf("⇒ outputs (%d)", len(names)), nodeIdx: -1})
-			kw := 0
-			for _, name := range names {
-				if n := len([]rune(name)); n > kw {
-					kw = n
-				}
-			}
-			if kw > 32 {
-				kw = 32
-			}
+			m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, diffLine: diffLine{text: fmt.Sprintf("⇒ outputs (%d)", len(names))}, nodeIdx: -1})
+			var lines []diffLine
 			for _, name := range names {
 				ch := m.plan.OutputChanges[name]
 				sym := byte('~')
@@ -625,14 +601,18 @@ func (m *model) rebuildRows() {
 				if b, ok := ch.BeforeSensitive.(bool); ok && b {
 					oldStr = "(sensitive)"
 				}
-				r := row{kind: rowDetail, key: name, keyW: kw, nodeIdx: -1, sym: sym}
+				l := diffLine{sym: sym, key: clean(name)}
 				if sym != '+' {
-					r.old = oldStr
+					l.old = oldStr
 				}
 				if sym != '-' {
-					r.new = newStr
+					l.new = newStr
 				}
-				m.rows = append(m.rows, r)
+				lines = append(lines, l)
+			}
+			kw := keyWidth(lines)
+			for _, l := range lines {
+				m.rows = append(m.rows, row{kind: rowDetail, diffLine: l, keyW: kw, nodeIdx: -1})
 			}
 		}
 	}
@@ -640,13 +620,13 @@ func (m *model) rebuildRows() {
 	// drift section
 	drift := m.plan.drifted()
 	if len(drift) > 0 {
-		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: fmt.Sprintf("≠ drift detected outside terraform (%d)", len(drift)), nodeIdx: -1})
+		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, diffLine: diffLine{text: fmt.Sprintf("≠ drift detected outside terraform (%d)", len(drift))}, nodeIdx: -1})
 		for _, rc := range drift {
 			sym, what := byte('~'), "changed"
 			if actionOf(rc.Change.Actions) == actDelete {
 				sym, what = '-', "deleted"
 			}
-			m.rows = append(m.rows, row{kind: rowDetail, text: rc.Address + "  (" + what + ")", nodeIdx: -1, sym: sym})
+			m.rows = append(m.rows, row{kind: rowDetail, diffLine: diffLine{text: clean(rc.Address) + "  (" + what + ")", sym: sym}, nodeIdx: -1})
 		}
 	}
 
@@ -668,11 +648,7 @@ func prettifyReason(r string) string {
 }
 
 func (m *model) bodyHeight() int {
-	h := m.height - 5
-	if h < 3 {
-		h = 3
-	}
-	return h
+	return max(m.height-5, 3)
 }
 
 func (m *model) clampScroll() {
@@ -739,17 +715,13 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key == "ctrl+c" || (key == "q" && m.stage != stageReview) {
 		switch m.stage {
 		case stagePlanning, stageApplying:
-			if !m.interrupted {
-				m.interrupted = true
-				m.proc.signal(os.Interrupt)
-				return m, nil
-			}
-			m.proc.kill()
+			// a second interrupt is terraform's own "stop now"; SIGKILL would
+			// leave the state lock held
+			m.interrupted = true
+			m.proc.signal(os.Interrupt)
 			return m, nil
-		case stageShowing:
-			m.quitting = true
-			return m, tea.Quit
 		default:
+			m.declined()
 			m.quitting = true
 			return m, tea.Quit
 		}
@@ -761,7 +733,7 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	if m.confirm {
 		switch key {
-		case "y", "Y", "enter":
+		case "y", "Y": // not enter: it expands rows, and terraform wants an explicit yes
 			m.confirm = false
 			return m.beginApply()
 		default:
@@ -773,6 +745,7 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch key {
 	case "q", "esc":
 		m.planRecap()
+		m.declined()
 		m.quitting = true
 		return m, tea.Quit
 	case "up", "k":
@@ -825,11 +798,15 @@ func (m model) unsetVars() []pendingVar {
 		}
 		pv := pendingVar{name: sm[1]}
 		if d.Range != nil {
-			pv.where = fmt.Sprintf("%s:%d", d.Range.Filename, d.Range.Start.Line)
-			pv.sensitive = declSensitive(m.chdir(), d.Range.Filename, d.Range.Start.Line)
+			pv.file, pv.line = d.Range.Filename, d.Range.Start.Line
+			pv.sensitive = declSensitive(m.chdir(), pv.file, pv.line)
 		}
 		out = append(out, pv)
 	}
+	// terraform reports them in random order; ask in declaration order
+	slices.SortFunc(out, func(a, b pendingVar) int {
+		return cmp.Or(strings.Compare(a.file, b.file), cmp.Compare(a.line, b.line))
+	})
 	return out
 }
 
@@ -919,14 +896,14 @@ func (m model) submitVar() (tea.Model, tea.Cmd) {
 
 // ---- recaps ----
 
-// refreshOnly reports whether the user asked for -refresh-only.
-func (m model) refreshOnly() bool {
-	for _, a := range m.cfg.o.planArgs {
-		if strings.TrimLeft(a, "-") == "refresh-only" {
-			return true
-		}
+// declined records leaving the review without applying. Like terraform's own
+// "Apply cancelled." that is a failure for apply and destroy, so `tf apply &&
+// next` doesn't carry on.
+func (m *model) declined() {
+	if m.cfg.sub != "plan" {
+		m.exitCode = 1
+		m.final = append(m.final, stDim.Render("Apply cancelled."))
 	}
-	return false
 }
 
 func (m *model) planRecap() {
@@ -940,7 +917,8 @@ func (m *model) planRecap() {
 	}
 	m.final = append(m.final, stBold.Render(line+"."))
 	if m.cfg.keepPlan {
-		m.final = append(m.final, stDim.Render("Plan saved to "+m.cfg.planPath+" — apply with: tf apply "+m.cfg.planPath))
+		apply := strings.Join(append(slices.Clone(m.cfg.o.globals), "apply", m.cfg.planPath), " ") // keeps -chdir
+		m.final = append(m.final, stDim.Render("Plan saved to "+m.cfg.planPath+" — apply with: tf "+apply))
 	}
 	m.appendDiagRecap()
 }
@@ -948,7 +926,7 @@ func (m *model) planRecap() {
 func (m *model) appendDiagRecap() {
 	seen := map[string]bool{} // terraform repeats some warnings at apply
 	for _, d := range append(append([]*Diagnostic{}, m.carried...), m.diags...) {
-		key := d.Severity + "|" + d.Summary + "|" + d.Detail
+		key := d.Severity + "|" + d.Address + "|" + d.Summary + "|" + d.Detail
 		if seen[key] {
 			continue
 		}
@@ -961,22 +939,17 @@ func (m *model) appendOutputsRecap() {
 	if len(m.outputs) == 0 {
 		return
 	}
-	names := make([]string, 0, len(m.outputs))
-	for k := range m.outputs {
-		names = append(names, k)
-	}
-	sort.Strings(names)
 	var lines []string
-	for _, name := range names {
+	for _, name := range slices.Sorted(maps.Keys(m.outputs)) {
 		o := m.outputs[name]
 		val := "(sensitive)"
 		if !o.Sensitive {
-			val = truncRunes(string(o.Value), 120)
+			val = truncRunes(clean(string(o.Value)), 120)
 		}
 		if strings.TrimSpace(val) == "" || val == "null" {
 			continue
 		}
-		lines = append(lines, "  "+stCyan.Render(name)+" = "+val)
+		lines = append(lines, "  "+stCyan.Render(clean(name))+" = "+val)
 	}
 	if len(lines) > 0 {
 		m.final = append(m.final, stBold.Render("Outputs:"))

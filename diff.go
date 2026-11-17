@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"sort"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -23,7 +25,26 @@ type diffLine struct {
 const maxDiffValueLen = 100
 const maxDiffLines = 400
 
-// flatten walks an arbitrary decoded-JSON value, producing dotted leaf paths.
+// Value paths. Each step is introduced by a control character that cannot
+// occur in a real key, so keys containing "." or "[" (kubernetes labels like
+// "app.kubernetes.io/name") can't be mistaken for nesting. display() turns a
+// path into the usual a.b[0].c form.
+const (
+	keyStep = "\x1f" // a map key / object attribute follows
+	idxStep = "\x1e" // a list index follows
+)
+
+func joinPath(prefix, key string) string  { return prefix + keyStep + key }
+func idxPath(prefix string, i int) string { return prefix + idxStep + strconv.Itoa(i) }
+
+var idxRe = regexp.MustCompile(idxStep + "([0-9]+)")
+
+func display(p string) string {
+	p = idxRe.ReplaceAllString(p, "[$1]")
+	return clean(strings.TrimPrefix(strings.ReplaceAll(p, keyStep, "."), "."))
+}
+
+// flatten walks an arbitrary decoded-JSON value, producing leaf paths.
 func flatten(prefix string, v any, out map[string]any) {
 	switch t := v.(type) {
 	case map[string]any:
@@ -40,7 +61,7 @@ func flatten(prefix string, v any, out map[string]any) {
 			return
 		}
 		for i, vv := range t {
-			flatten(fmt.Sprintf("%s[%d]", prefix, i), vv, out)
+			flatten(idxPath(prefix, i), vv, out)
 		}
 	default:
 		out[prefix] = v
@@ -58,21 +79,14 @@ func subtrees(prefix string, v any, out map[string]any) {
 		}
 	case []any:
 		for i, vv := range t {
-			subtrees(fmt.Sprintf("%s[%d]", prefix, i), vv, out)
+			subtrees(idxPath(prefix, i), vv, out)
 		}
 	}
 }
 
-func joinPath(prefix, key string) string {
-	if prefix == "" {
-		return key
-	}
-	return prefix + "." + key
-}
-
-// parentPath drops the last path step.
+// parentPath drops the last path step (a top-level key's parent is the root "").
 func parentPath(p string) (string, bool) {
-	i := strings.LastIndexAny(p, ".[")
+	i := strings.LastIndexAny(p, keyStep+idxStep)
 	if i < 0 {
 		return "", false
 	}
@@ -94,7 +108,7 @@ func marked(set map[string]bool, path string) bool {
 // anyUnder reports whether path itself or anything inside it is flagged.
 func anyUnder(set map[string]bool, path string) bool {
 	for p := range set {
-		if p == path || strings.HasPrefix(p, path+".") || strings.HasPrefix(p, path+"[") {
+		if p == path || strings.HasPrefix(p, path+keyStep) || strings.HasPrefix(p, path+idxStep) {
 			return true
 		}
 	}
@@ -127,25 +141,24 @@ func renderVal(v any) string {
 	if err := enc.Encode(v); err != nil {
 		return fmt.Sprintf("%v", v)
 	}
-	s := strings.ReplaceAll(strings.TrimSuffix(buf.String(), "\n"), "\\n", "↵")
-	return truncRunes(s, maxDiffValueLen)
+	return truncRunes(clean(strings.TrimSuffix(buf.String(), "\n")), maxDiffValueLen)
 }
 
+// replacePathPrefixes converts terraform's replace_paths (a list of steps:
+// strings are keys, numbers are indexes) to our path form.
 func replacePathPrefixes(rps [][]any) []string {
 	var out []string
 	for _, rp := range rps {
-		var parts []string
+		p := ""
 		for _, step := range rp {
 			switch s := step.(type) {
 			case string:
-				parts = append(parts, s)
+				p = joinPath(p, s)
 			case float64:
-				if len(parts) > 0 {
-					parts[len(parts)-1] = fmt.Sprintf("%s[%d]", parts[len(parts)-1], int(s))
-				}
+				p = idxPath(p, int(s))
 			}
 		}
-		out = append(out, strings.Join(parts, "."))
+		out = append(out, p)
 	}
 	return out
 }
@@ -179,11 +192,11 @@ func diffResource(ch *ChangeRepr) []diffLine {
 			keys = append(keys, k)
 		}
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 
 	forcesRepl := func(path string) bool {
 		for _, p := range forces {
-			if p != "" && (path == p || strings.HasPrefix(path, p+".") || strings.HasPrefix(path, p+"[")) {
+			if p != "" && (path == p || strings.HasPrefix(path, p+keyStep) || strings.HasPrefix(path, p+idxStep)) {
 				return true
 			}
 		}
@@ -229,11 +242,11 @@ func diffResource(ch *ChangeRepr) []diffLine {
 			if !unk && reflect.DeepEqual(a, b) {
 				continue // unchanged
 			}
-			lines = append(lines, diffLine{sym: '~', key: k, old: oldStr, new: newStr, forces: forcesRepl(k)})
+			lines = append(lines, diffLine{sym: '~', key: display(k), old: oldStr, new: newStr, forces: forcesRepl(k)})
 		case !hasB && (hasA || unk):
-			lines = append(lines, diffLine{sym: '+', key: k, new: newStr})
+			lines = append(lines, diffLine{sym: '+', key: display(k), new: newStr})
 		case hasB:
-			lines = append(lines, diffLine{sym: '-', key: k, old: oldStr})
+			lines = append(lines, diffLine{sym: '-', key: display(k), old: oldStr})
 		}
 	}
 	return lines

@@ -36,10 +36,10 @@ brews:
   - name: tf
     directory: Formula
     repository:
-      owner: jdforsythe
+      owner: Federico-Baldan
       name: homebrew-tap
       token: "{{ .Env.TAP_GITHUB_TOKEN }}"
-    homepage: https://github.com/jdforsythe/tf
+    homepage: https://github.com/Federico-Baldan/tf
     description: "A prettier, interactive TUI for terraform plan/apply/destroy"
     license: MIT
     install: |
@@ -50,4 +50,4 @@ brews:
 release:
   footer: |
     ---
-    Install via Homebrew: `brew install jdforsythe/tap/tf`
+    Install via Homebrew: `brew install federico-baldan/tap/tf`

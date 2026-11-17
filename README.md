@@ -9,8 +9,12 @@ passes straight through.
 
 ![demo](demo.gif)
 
-[![ci](https://github.com/jdforsythe/tf/actions/workflows/ci.yml/badge.svg)](https://github.com/jdforsythe/tf/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/jdforsythe/tf)](https://github.com/jdforsythe/tf/releases)
+> A personal fork of [jdforsythe/tf](https://github.com/jdforsythe/tf) (MIT),
+> with prompts for missing variables, import/move/forget support in the plan
+> tree, and a few display fixes.
+
+[![ci](https://github.com/Federico-Baldan/tf/actions/workflows/ci.yml/badge.svg)](https://github.com/Federico-Baldan/tf/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/Federico-Baldan/tf)](https://github.com/Federico-Baldan/tf/releases)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## Why
@@ -29,10 +33,15 @@ plan from `terraform show -json` instead of scraping text, and renders:
 - **Progress headline** — progress bar, `done/total`, percent, active count,
   per-resource timing, and a naive ETA from the observed completion rate.
 - **Collapsible plan tree** — resources grouped into
-  `＋ create / ～ update / ± replace / － destroy`, collapsed to just names by
-  default. Expand any resource for an attribute-level diff: `old → new`,
+  `＋ create / ～ update / ± replace / － destroy` (plus `↓ import`, `→ move`
+  and `⊘ forget` for state-only changes), collapsed to just names by default. Expand any resource for an attribute-level diff: `old → new`,
   `(known after apply)`, `(sensitive)`, and `# forces replacement` flags.
   Output changes and detected drift get their own sections.
+- **Missing variables, asked for** — if a required variable has no value,
+  `tf` prompts for it instead of failing, then re-runs the plan. Values go
+  to terraform through `TF_VAR_*` (never the process list); strings are taken
+  as typed, lists and maps as HCL. Names that look secret (`password`,
+  `token`, `key`…) are hidden as you type.
 - **A real approval gate** — for `apply`/`destroy` the plan tree *is* the
   confirmation prompt. Review, then press `a` `y`. Destroys get a red
   warning with the count.
@@ -40,16 +49,16 @@ plan from `terraform show -json` instead of scraping text, and renders:
 ## Install
 
 ```sh
-brew install jdforsythe/tap/tf
+brew install federico-baldan/tap/tf
 ```
 
 or with Go:
 
 ```sh
-go install github.com/jdforsythe/tf@latest
+go install github.com/Federico-Baldan/tf@latest
 ```
 
-or grab a binary from [releases](https://github.com/jdforsythe/tf/releases),
+or grab a binary from [releases](https://github.com/Federico-Baldan/tf/releases),
 or build from source with `make install`.
 
 `tf` invokes whatever `terraform` is on your `PATH`. Point it elsewhere with
@@ -122,4 +131,4 @@ needs no providers, no network, and no cloud account.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE) — original work © Jeremy Forsythe, modifications © Federico Baldan.

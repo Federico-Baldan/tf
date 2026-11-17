@@ -1,56 +1,51 @@
 # vhs demo of the tf wrapper — run from the repo root: vhs demo.tape
 Output demo.gif
 
-Set FontSize 15
+Set FontSize 17
 Set Width 1100
-Set Height 680
-Set Padding 12
-Set TypingSpeed 60ms
+Set Height 620
+Set Padding 14
+Set TypingSpeed 45ms
 
 Hide
 Type `export PATH="$PWD:$PATH" && cd demo && clear`
 Enter
 Show
 
-# ---- apply: plan progress -> review tree -> approve -> live apply ----
+# ---- apply: plan -> review tree -> approve -> live progress ----
 Type "tf apply"
 Enter
-Sleep 4.5s
-
-# navigate the review tree
-Type "j"
-Sleep 600ms
-Type "j"
-Sleep 600ms
-Enter
-Sleep 2s
-Type "e"
-Sleep 2.5s
-Type "c"
+Wait+Screen /Plan: \+9/
 Sleep 1.2s
-
-# approve
+Type "j"
+Sleep 300ms
+Type "j"
+Sleep 300ms
+Enter
+Sleep 1.8s
 Type "a"
 Sleep 1.2s
 Type "y"
-Sleep 13s
-Sleep 2s
+Wait+Screen /Apply complete/
+Sleep 1.5s
 
-# ---- plan with changes: collapsible diff review ----
+# ---- plan with changes: expand every diff ----
 Type "tf plan -var flavor=chocolate"
 Enter
-Sleep 5s
+Wait+Screen /Plan: ~4/
+Sleep 1s
 Type "e"
-Sleep 3.5s
+Sleep 2.8s
 Type "q"
-Sleep 2.5s
+Sleep 1s
 
 # ---- destroy: review gate with red warning ----
 Type "tf destroy"
 Enter
-Sleep 5s
+Wait+Screen /Destroy plan/
+Sleep 1.2s
 Type "a"
 Sleep 1.5s
 Type "y"
-Sleep 6s
-Sleep 2s
+Wait+Screen /Destroy complete/
+Sleep 1.5s

@@ -3,6 +3,7 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch: # fallback: `gh workflow run release.yml --ref v0.2.0` if the tag push doesn't trigger it
 
 permissions:
   contents: write

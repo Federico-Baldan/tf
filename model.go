@@ -3,9 +3,11 @@ package main
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -14,6 +16,7 @@ type stage int
 
 const (
 	stagePlanning stage = iota
+	stagePrompt         // asking for required variables the plan failed on
 	stageShowing
 	stageReview
 	stageApplying
@@ -70,10 +73,20 @@ const (
 type row struct {
 	kind    rowKind
 	text    string
+	note    string // dim suffix on node rows: reason, import id, previous address
 	nodeIdx int
 	sym     byte   // for detail rows
-	action  string // for node rows
+	action  string // for node and section rows
 	forces  bool
+	// attribute detail rows (empty key = free-form text)
+	key, old, new string
+	keyW          int // key column width shared by the node's rows
+}
+
+// pendingVar is a required variable terraform reported as unset.
+type pendingVar struct {
+	name  string
+	where string // file:line of the declaration
 }
 
 type model struct {
@@ -98,6 +111,12 @@ type model struct {
 	diags       []*Diagnostic
 	summary     *ChangeSummary
 	outputs     map[string]*OutputMeta
+
+	// variable prompt: queue of unset variables, the text typed so far, and
+	// the TF_VAR_* entries collected for the next plan run
+	queue []pendingVar
+	input string
+	vars  []string
 
 	// review stage
 	plan    *Plan
@@ -154,8 +173,9 @@ func (m model) startPlanCmd() tea.Cmd {
 	}
 	args = append(args, m.cfg.o.shared...)
 	args = append(args, m.cfg.o.planArgs...)
+	env := m.vars
 	return func() tea.Msg {
-		if err := startTF(m.cfg.tfBin, args, "plan", m.events, m.proc); err != nil {
+		if err := startTF(m.cfg.tfBin, args, "plan", env, m.events, m.proc); err != nil {
 			return exitMsg{phase: "plan", code: 1, err: err}
 		}
 		return nil
@@ -168,7 +188,7 @@ func (m model) startApplyCmd() tea.Cmd {
 	args = append(args, m.cfg.o.shared...)
 	args = append(args, m.cfg.planPath)
 	return func() tea.Msg {
-		if err := startTF(m.cfg.tfBin, args, "apply", m.events, m.proc); err != nil {
+		if err := startTF(m.cfg.tfBin, args, "apply", nil, m.events, m.proc); err != nil {
 			return exitMsg{phase: "apply", code: 1, err: err}
 		}
 		return nil
@@ -190,7 +210,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.spin++
 		m.reapTasks()
-		if m.stage == stagePlanning || m.stage == stageShowing || m.stage == stageApplying {
+		// the prompt keeps the chain alive so the retry needs no new tick
+		if m.stage == stagePlanning || m.stage == stagePrompt || m.stage == stageShowing || m.stage == stageApplying {
 			return m, tickCmd()
 		}
 		return m, nil
@@ -297,6 +318,10 @@ func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 	switch msg.phase {
 	case "plan":
 		if msg.code != 0 {
+			if q := m.unsetVars(); !m.interrupted && len(q) > 0 {
+				m.queue, m.input, m.stage = q, "", stagePrompt
+				return m, nil
+			}
 			m.exitCode = 1
 			if m.interrupted {
 				m.final = append(m.final, stYellow.Render("Plan interrupted."))
@@ -332,7 +357,11 @@ func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 				m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Destroy complete in %s — %s destroyed.", fmtDur(elapsed), plural(n, "resource"))))
 			} else {
 				if s := m.summary; s != nil {
-					m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Apply complete in %s — %d added, %d changed, %d destroyed.", fmtDur(elapsed), s.Add, s.Change, s.Remove)))
+					imported := ""
+					if s.Import > 0 {
+						imported = fmt.Sprintf(", %d imported", s.Import)
+					}
+					m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Apply complete in %s — %d added, %d changed, %d destroyed%s.", fmtDur(elapsed), s.Add, s.Change, s.Remove, imported)))
 				} else {
 					m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Apply complete in %s — %s.", fmtDur(elapsed), plural(m.completed, "resource"))))
 				}
@@ -384,7 +413,7 @@ func (m model) beginApply() (tea.Model, tea.Cmd) {
 	m.tasks = map[string]*task{}
 	m.order = nil
 	m.completed, m.failed = 0, 0
-	m.total = m.counts.total()
+	m.total = m.counts.hooks()
 	m.startedAt = time.Now()
 	m.diags = nil
 	return m, tea.Batch(m.startApplyCmd(), waitFor(m.events), tickCmd())
@@ -395,22 +424,26 @@ func (m model) beginApply() (tea.Model, tea.Cmd) {
 func (m *model) buildTree() {
 	m.nodes = nil
 	add := func(rc *ResourceChange, action string) {
+		detail := diffResource(rc.Change)
+		if action == actForget {
+			detail = nil // the resource stays; red "-" lines would read as a delete
+		}
 		m.nodes = append(m.nodes, &node{
 			addr:   rc.Address,
 			action: action,
-			reason: prettifyReason(rc.ActionReason),
-			detail: diffResource(rc.Change),
+			reason: noteOf(rc, action),
+			detail: detail,
 		})
 	}
 	byAction := map[string][]*ResourceChange{}
 	for _, rc := range m.plan.ResourceChanges {
-		a := actionOf(rc.Change.Actions)
+		a := kindOf(rc)
 		if a == actNoop {
 			continue
 		}
 		byAction[a] = append(byAction[a], rc)
 	}
-	for _, a := range []string{actCreate, actUpdate, actReplace, actDelete, actRead} {
+	for _, a := range []string{actImport, actCreate, actUpdate, actReplace, actDelete, actForget, actMove, actRead} {
 		rcs := byAction[a]
 		sort.Slice(rcs, func(i, j int) bool { return rcs[i].Address < rcs[j].Address })
 		for _, rc := range rcs {
@@ -432,8 +465,49 @@ func sectionTitle(action string, n int) string {
 		return fmt.Sprintf("－ destroy (%d)", n)
 	case actRead:
 		return fmt.Sprintf("↻ read (%d)", n)
+	case actImport:
+		return fmt.Sprintf("↓ import (%d)", n)
+	case actForget:
+		return fmt.Sprintf("⊘ forget — leaves state, resource kept (%d)", n)
+	case actMove:
+		return fmt.Sprintf("→ move (%d)", n)
 	}
 	return action
+}
+
+// noteOf says why a node is listed: replace/delete reason, import id,
+// previous address.
+func noteOf(rc *ResourceChange, action string) string {
+	var parts []string
+	if r := prettifyReason(rc.ActionReason); r != "" && action != actForget {
+		parts = append(parts, r)
+	}
+	if im := rc.Change.Importing; im != nil && im.ID != "" {
+		if action == actImport {
+			parts = append(parts, "id "+im.ID)
+		} else {
+			parts = append(parts, "imported from "+im.ID)
+		}
+	}
+	if rc.PreviousAddress != "" && rc.PreviousAddress != rc.Address {
+		parts = append(parts, "moved from "+rc.PreviousAddress)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// keyWidth is the widest attribute key in a node, capped so one long path
+// doesn't push every value off screen.
+func keyWidth(lines []diffLine) int {
+	w := 0
+	for _, d := range lines {
+		if n := len([]rune(d.key)); n > w {
+			w = n
+		}
+	}
+	if w > 32 {
+		w = 32
+	}
+	return w
 }
 
 func (m *model) rebuildRows() {
@@ -448,24 +522,21 @@ func (m *model) rebuildRows() {
 			if last != "" {
 				m.rows = append(m.rows, row{kind: rowBlank})
 			}
-			m.rows = append(m.rows, row{kind: rowSection, text: sectionTitle(n.action, counts[n.action]), nodeIdx: -1})
+			m.rows = append(m.rows, row{kind: rowSection, text: sectionTitle(n.action, counts[n.action]), nodeIdx: -1, action: n.action})
 			last = n.action
 		}
 		caret := "▸"
 		if n.expanded {
 			caret = "▾"
 		}
-		title := n.addr
-		if n.reason != "" {
-			title += "  (" + n.reason + ")"
-		}
-		m.rows = append(m.rows, row{kind: rowNode, text: caret + " " + title, nodeIdx: i, action: n.action})
+		m.rows = append(m.rows, row{kind: rowNode, text: caret + " " + n.addr, note: n.reason, nodeIdx: i, action: n.action})
 		if n.expanded {
 			if len(n.detail) == 0 {
 				m.rows = append(m.rows, row{kind: rowDetail, text: "(no attribute changes)", nodeIdx: i, sym: ' '})
 			}
+			kw := keyWidth(n.detail)
 			for _, d := range n.detail {
-				m.rows = append(m.rows, row{kind: rowDetail, text: d.text, nodeIdx: i, sym: d.sym, forces: d.forces})
+				m.rows = append(m.rows, row{kind: rowDetail, text: d.text, key: d.key, old: d.old, new: d.new, keyW: kw, nodeIdx: i, sym: d.sym, forces: d.forces})
 			}
 		}
 	}
@@ -481,6 +552,15 @@ func (m *model) rebuildRows() {
 		if len(names) > 0 {
 			sort.Strings(names)
 			m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: fmt.Sprintf("⇒ outputs (%d)", len(names)), nodeIdx: -1})
+			kw := 0
+			for _, name := range names {
+				if n := len([]rune(name)); n > kw {
+					kw = n
+				}
+			}
+			if kw > 32 {
+				kw = 32
+			}
 			for _, name := range names {
 				ch := m.plan.OutputChanges[name]
 				sym := byte('~')
@@ -500,13 +580,14 @@ func (m *model) rebuildRows() {
 				if b, ok := ch.BeforeSensitive.(bool); ok && b {
 					oldStr = "(sensitive)"
 				}
-				text := name + " = " + newStr
-				if sym == '~' {
-					text = name + ": " + oldStr + " → " + newStr
-				} else if sym == '-' {
-					text = name + " (was " + oldStr + ")"
+				r := row{kind: rowDetail, key: name, keyW: kw, nodeIdx: -1, sym: sym}
+				if sym != '+' {
+					r.old = oldStr
 				}
-				m.rows = append(m.rows, row{kind: rowDetail, text: text, nodeIdx: -1, sym: sym})
+				if sym != '-' {
+					r.new = newStr
+				}
+				m.rows = append(m.rows, r)
 			}
 		}
 	}
@@ -605,6 +686,9 @@ func (m *model) setAllExpanded(v bool) {
 // ---- keys ----
 
 func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.stage == stagePrompt {
+		return m.handlePromptKey(k) // typed text, so q must not quit
+	}
 	key := k.String()
 
 	// interrupt handling for running stages
@@ -673,11 +757,99 @@ func (m model) handleKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// ---- required-variable prompt ----
+
+var unsetVarRe = regexp.MustCompile(`input variable "([^"]+)" is not set`)
+
+// unsetVars returns the required variables a failed plan reported as unset.
+// It returns nil when the failure was anything else, or when a variable we
+// already supplied is still reported (a bad value must not loop forever).
+func (m model) unsetVars() []pendingVar {
+	var out []pendingVar
+	for _, d := range m.diags {
+		if d.Severity != "error" {
+			continue
+		}
+		sm := unsetVarRe.FindStringSubmatch(d.Detail)
+		if d.Summary != "No value for required variable" || sm == nil {
+			return nil
+		}
+		for _, v := range m.vars {
+			if strings.HasPrefix(v, "TF_VAR_"+sm[1]+"=") {
+				return nil
+			}
+		}
+		pv := pendingVar{name: sm[1]}
+		if d.Range != nil {
+			pv.where = fmt.Sprintf("%s:%d", d.Range.Filename, d.Range.Start.Line)
+		}
+		out = append(out, pv)
+	}
+	return out
+}
+
+var secretNameRe = regexp.MustCompile(`(?i)pass|secret|token|key|cred|auth`)
+
+// masked reports whether the typed value should be hidden. terraform doesn't
+// tell us which variables are sensitive, so go by the name.
+func (v pendingVar) masked() bool { return secretNameRe.MatchString(v.name) }
+
+func (m model) handlePromptKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.Type {
+	case tea.KeyCtrlC, tea.KeyEsc:
+		// give up: report the plan failure exactly as if there were no prompt
+		m.exitCode = 1
+		m.final = append(m.final, stRedBold.Render("✗ Plan failed."))
+		m.appendDiagRecap()
+		m.stage, m.quitting = stageDone, true
+		return m, tea.Quit
+	case tea.KeyEnter:
+		if m.input == "" {
+			return m, nil
+		}
+		return m.submitVar()
+	case tea.KeyBackspace:
+		if r := []rune(m.input); len(r) > 0 {
+			m.input = string(r[:len(r)-1])
+		}
+	case tea.KeyCtrlU:
+		m.input = ""
+	case tea.KeySpace:
+		m.input += " "
+	case tea.KeyRunes:
+		m.input += strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return -1 // pasted newlines
+			}
+			return r
+		}, string(k.Runes))
+	}
+	return m, nil
+}
+
+// submitVar stores the typed value and moves on: next variable, or once the
+// queue is empty, run the plan again.
+func (m model) submitVar() (tea.Model, tea.Cmd) {
+	m.vars = append(m.vars, "TF_VAR_"+m.queue[0].name+"="+m.input)
+	m.queue, m.input = m.queue[1:], ""
+	if len(m.queue) > 0 {
+		return m, nil
+	}
+	m.stage = stagePlanning
+	m.diags, m.tasks, m.order = nil, map[string]*task{}, nil
+	m.refreshed, m.plannedSeen = 0, 0
+	m.startedAt = time.Now()
+	return m, tea.Batch(m.startPlanCmd(), waitFor(m.events))
+}
+
 // ---- recaps ----
 
 func (m *model) planRecap() {
 	c := m.counts
 	line := fmt.Sprintf("Plan: %d to add, %d to change, %d to destroy", c.add+c.replace, c.change, c.destroy+c.replace)
+	if c.imports > 0 {
+		line = fmt.Sprintf("Plan: %d to import, %d to add, %d to change, %d to destroy", c.imports, c.add+c.replace, c.change, c.destroy+c.replace)
+	}
 	if c.replace > 0 {
 		line += fmt.Sprintf(" (%d replaced)", c.replace)
 	}

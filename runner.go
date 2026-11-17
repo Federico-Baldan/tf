@@ -57,9 +57,11 @@ func (p *procHolder) kill() {
 
 // startTF launches terraform with -json streaming output, parsing each line
 // into an Event and pushing it onto ch. Sends exitMsg when done.
-func startTF(bin string, args []string, phase string, ch chan tea.Msg, holder *procHolder) error {
+// env holds extra KEY=value entries (TF_VAR_* for variables typed in the TUI;
+// the environment keeps secrets out of the process list, unlike -var).
+func startTF(bin string, args []string, phase string, env []string, ch chan tea.Msg, holder *procHolder) error {
 	cmd := exec.Command(bin, args...)
-	cmd.Env = append(os.Environ(), "TF_IN_AUTOMATION=1")
+	cmd.Env = append(append(os.Environ(), "TF_IN_AUTOMATION=1"), env...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err

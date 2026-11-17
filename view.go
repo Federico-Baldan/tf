@@ -15,6 +15,8 @@ func (m model) View() string {
 	switch m.stage {
 	case stagePlanning:
 		return m.viewProgress(false)
+	case stagePrompt:
+		return m.viewPrompt()
 	case stageShowing:
 		return m.viewShowing()
 	case stageReview:
@@ -73,7 +75,7 @@ func (m model) viewProgress(applying bool) string {
 	if maxRows < 3 {
 		maxRows = 3
 	}
-	nameW := m.width - 22
+	nameW := m.width - 24
 	if nameW < 20 {
 		nameW = 20
 	}
@@ -90,9 +92,11 @@ func (m model) viewProgress(applying bool) string {
 		}
 		shown++
 		name := shorten(addr, nameW)
+		glyph, gs := hookGlyph(t.action)
+		g := gs.Render(glyph)
 		switch t.status {
 		case taskRunning:
-			line := fmt.Sprintf("   %s %s %s", m.spinner(), stYellow.Render(name), stDim.Render(fmtDur(time.Since(t.start))))
+			line := fmt.Sprintf("   %s %s %s %s", m.spinner(), g, stYellow.Render(name), stDim.Render(fmtDur(time.Since(t.start))))
 			if t.note != "" {
 				line += " " + stCyan.Render("("+t.note+")")
 			}
@@ -102,7 +106,7 @@ func (m model) viewProgress(applying bool) string {
 			if t.elapsed > 0 {
 				dur = stDim.Render(fmtDur(time.Duration(t.elapsed * float64(time.Second))))
 			}
-			b.WriteString(fmt.Sprintf("   %s %s %s\n", stGreen.Render("✓"), stGreen.Render(name), dur))
+			b.WriteString(fmt.Sprintf("   %s %s %s %s\n", stGreen.Render("✓"), g, stGreen.Render(name), dur))
 		}
 	}
 	if hidden > 0 {
@@ -120,6 +124,9 @@ func (m model) viewProgress(applying bool) string {
 }
 
 func (m model) progressLine(elapsed time.Duration) string {
+	if m.total == 0 {
+		return stDim.Render("updating state…") // import/move only: terraform emits no per-resource events
+	}
 	total := m.total
 	if total == 0 {
 		total = 1
@@ -228,6 +235,9 @@ func (m model) viewReview() string {
 		title = "Destroy plan"
 	}
 	parts := []string{}
+	if c.imports > 0 {
+		parts = append(parts, stCyan.Render(fmt.Sprintf("↓%d import", c.imports)))
+	}
 	if c.add > 0 {
 		parts = append(parts, stGreen.Render(fmt.Sprintf("+%d add", c.add)))
 	}
@@ -239,6 +249,9 @@ func (m model) viewReview() string {
 	}
 	if c.destroy > 0 {
 		parts = append(parts, stRed.Render(fmt.Sprintf("-%d destroy", c.destroy)))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, stDim.Render("state changes only"))
 	}
 	header := " " + stBold.Render(title+":") + " " + strings.Join(parts, "  ")
 	if len(m.diags) > 0 {
@@ -252,7 +265,7 @@ func (m model) viewReview() string {
 			header += "  " + stYellow.Render(fmt.Sprintf("⚠ %d", warns))
 		}
 	}
-	b.WriteString("\n" + header + "\n\n")
+	b.WriteString("\n" + header + "\n " + stDim.Render(strings.Repeat("─", max(m.width-2, 1))) + "\n")
 
 	h := m.bodyHeight()
 	end := m.offset + h
@@ -282,7 +295,7 @@ func (m model) viewReview() string {
 		if len(m.rows) > h {
 			scroll = fmt.Sprintf(" %d/%d ", m.cursor+1, len(m.rows))
 		}
-		footer = " " + stDim.Render("↑↓ move  ⏎ expand  e/c all  a apply  q quit"+scroll)
+		footer = " " + hint("↑↓", "move") + "  " + hint("⏎", "expand") + "  " + hint("e/c", "all") + "  " + hint("a", "apply") + "  " + hint("q", "quit") + stDim.Render(scroll)
 	}
 	b.WriteString(footer)
 	return b.String()
@@ -300,21 +313,27 @@ func (m model) renderRow(i int) string {
 		cursorMark = stCyan.Render("│ ")
 	}
 
-	var line string
 	switch r.kind {
-	case rowBlank:
-		return ""
 	case rowSection:
-		return " " + stSection.Render(r.text)
+		style := stSection
+		if r.action != "" {
+			_, s := actionGlyph(r.action)
+			style = s.Bold(true) // section colour follows the action
+		}
+		return " " + style.Render(r.text)
 	case rowNode:
 		glyph, style := actionGlyph(r.action)
 		text := truncRunes(r.text, w)
-		if isCursor {
-			line = " " + cursorMark + style.Render(glyph) + " " + stCursor.Render(text)
-		} else {
-			line = " " + cursorMark + style.Render(glyph) + " " + text
+		note := ""
+		if rest := w - len([]rune(text)); r.note != "" && rest >= 12 {
+			note = "  (" + truncRunes(r.note, rest-5) + ")"
 		}
-		return line
+		if isCursor {
+			// highlight the whole row, not just the address
+			pad := strings.Repeat(" ", max(w-len([]rune(text))-len([]rune(note)), 0))
+			return " " + cursorMark + style.Render(glyph) + " " + stCursor.Render(text) + stCursorNote.Render(note+pad)
+		}
+		return " " + cursorMark + style.Render(glyph) + " " + text + stDim.Render(note)
 	case rowDetail:
 		var style lipgloss.Style
 		switch r.sym {
@@ -327,12 +346,71 @@ func (m model) renderRow(i int) string {
 		default:
 			style = stDim
 		}
-		text := truncRunes(r.text, w-6)
-		out := " " + cursorMark + "    " + style.Render(string(r.sym)+" "+text)
+		prefix := " " + cursorMark + "    "
+		if r.key == "" {
+			return prefix + style.Render(string(r.sym)+" "+truncRunes(r.text, w-6))
+		}
+		out := prefix + style.Render(string(r.sym)) + " " + m.renderAttr(r, w-6)
 		if r.forces {
 			out += " " + stMagenta.Render("# forces replacement")
 		}
 		return out
 	}
-	return line
+	return ""
+}
+
+// renderAttr draws "key: old → new" with the key column aligned and the old
+// and new values coloured, fitting avail cells.
+func (m model) renderAttr(r row, avail int) string {
+	kw := max(r.keyW, len([]rune(r.key)))
+	// colon hugs the key; the padding after it aligns the values
+	key := r.key + stDim.Render(":") + strings.Repeat(" ", kw-len([]rune(r.key))+1)
+	budget := max(avail-kw-2, 8)
+	if r.sym == '~' {
+		budget = max(budget-3, 8)
+		// shrink only what doesn't fit, and never starve the shorter side
+		ol, nl := len([]rune(r.old)), len([]rune(r.new))
+		ol = min(ol, max(budget/2, budget-nl))
+		nl = min(nl, budget-ol)
+		return key + valStyle(r.old, stRed).Render(truncRunes(r.old, ol)) + stDim.Render(" → ") + valStyle(r.new, stGreen).Render(truncRunes(r.new, max(nl, 4)))
+	}
+	if r.sym == '-' {
+		return key + valStyle(r.old, stRed).Render(truncRunes(r.old, budget))
+	}
+	return key + valStyle(r.new, stGreen).Render(truncRunes(r.new, budget))
+}
+
+// valStyle dims placeholders so real values stand out.
+func valStyle(v string, s lipgloss.Style) lipgloss.Style {
+	switch v {
+	case "null", "(known after apply)", "(sensitive)":
+		return stDim
+	}
+	return s
+}
+
+// ---- variable prompt ----
+
+func (m model) viewPrompt() string {
+	v := m.queue[0]
+	title := "Variable required"
+	if n := len(m.vars) + len(m.queue); n > 1 {
+		title += fmt.Sprintf("  %d/%d", len(m.vars)+1, n)
+	}
+	shown := m.input
+	help := "text as-is · lists and maps as HCL, e.g. [\"a\",\"b\"]"
+	if v.masked() {
+		shown = strings.Repeat("•", len([]rune(m.input)))
+		help = "input hidden"
+	}
+	var b strings.Builder
+	b.WriteString("\n " + stCyan.Render("?") + " " + stBold.Render(title) + "\n")
+	b.WriteString("   " + stBold.Render("var."+v.name))
+	if v.where != "" {
+		b.WriteString("  " + stDim.Render(v.where))
+	}
+	b.WriteString("\n\n   " + stCyan.Render("›") + " " + shown + stCyan.Render("▏") + "\n")
+	b.WriteString("   " + stDim.Render(help) + "\n\n")
+	b.WriteString(" " + hint("⏎", "set") + "  " + hint("esc", "cancel"))
+	return b.String()
 }

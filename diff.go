@@ -9,10 +9,14 @@ import (
 )
 
 // A single attribute-level diff line inside an expanded resource node.
+// Attribute lines carry key/old/new so the view can colour and align them;
+// free-form lines (notices) use text alone.
 type diffLine struct {
-	sym    byte // '+', '-', '~'
-	text   string
-	forces bool // attribute forces replacement
+	sym      byte // '+', '-', '~'
+	key      string
+	old, new string
+	text     string
+	forces   bool // attribute forces replacement
 }
 
 const maxDiffValueLen = 100
@@ -166,11 +170,11 @@ func diffResource(ch *ChangeRepr) []diffLine {
 			if sensB[k] && sensA[k] && reflect.DeepEqual(a, b) {
 				continue
 			}
-			lines = append(lines, diffLine{sym: '~', text: fmt.Sprintf("%s: %s → %s", k, oldStr, newStr), forces: forcesRepl(k)})
+			lines = append(lines, diffLine{sym: '~', key: k, old: oldStr, new: newStr, forces: forcesRepl(k)})
 		case !hasB && (hasA || unk):
-			lines = append(lines, diffLine{sym: '+', text: fmt.Sprintf("%s: %s", k, newStr)})
+			lines = append(lines, diffLine{sym: '+', key: k, new: newStr})
 		case hasB:
-			lines = append(lines, diffLine{sym: '-', text: fmt.Sprintf("%s: %s", k, oldStr)})
+			lines = append(lines, diffLine{sym: '-', key: k, old: oldStr})
 		}
 	}
 	return lines

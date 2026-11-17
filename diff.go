@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -46,11 +47,48 @@ func flatten(prefix string, v any, out map[string]any) {
 	}
 }
 
+// subtrees records every value in v, containers included, under the same
+// paths flatten uses, so a collapsed collection can be rendered by lookup.
+func subtrees(prefix string, v any, out map[string]any) {
+	out[prefix] = v
+	switch t := v.(type) {
+	case map[string]any:
+		for k, vv := range t {
+			subtrees(joinPath(prefix, k), vv, out)
+		}
+	case []any:
+		for i, vv := range t {
+			subtrees(fmt.Sprintf("%s[%d]", prefix, i), vv, out)
+		}
+	}
+}
+
 func joinPath(prefix, key string) string {
 	if prefix == "" {
 		return key
 	}
 	return prefix + "." + key
+}
+
+// parentPath drops the last path step.
+func parentPath(p string) (string, bool) {
+	i := strings.LastIndexAny(p, ".[")
+	if i < 0 {
+		return "", false
+	}
+	return p[:i], true
+}
+
+// marked reports whether path, or any container above it, is flagged.
+// terraform flags a whole sensitive or unknown collection once, at the
+// collection itself, not on each element inside it.
+func marked(set map[string]bool, path string) bool {
+	for p, ok := path, true; ok; p, ok = parentPath(p) {
+		if set[p] {
+			return true
+		}
+	}
+	return false
 }
 
 // truePaths collects paths whose leaf value is `true` (used for
@@ -67,20 +105,20 @@ func truePaths(v any) map[string]bool {
 	return out
 }
 
+// renderVal prints a value as compact JSON, without HTML escaping (so & < >
+// stay readable) and cut on rune boundaries.
 func renderVal(v any) string {
 	if v == nil {
 		return "null"
 	}
-	b, err := json.Marshal(v)
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		return fmt.Sprintf("%v", v)
 	}
-	s := string(b)
-	s = strings.ReplaceAll(s, "\\n", "↵")
-	if len(s) > maxDiffValueLen {
-		s = s[:maxDiffValueLen-1] + "…"
-	}
-	return s
+	s := strings.ReplaceAll(strings.TrimSuffix(buf.String(), "\n"), "\\n", "↵")
+	return truncRunes(s, maxDiffValueLen)
 }
 
 func replacePathPrefixes(rps [][]any) []string {
@@ -108,6 +146,8 @@ func diffResource(ch *ChangeRepr) []diffLine {
 	after := map[string]any{}
 	flatten("", ch.Before, before)
 	flatten("", ch.After, after)
+	beforeAll := map[string]any{}
+	subtrees("", ch.Before, beforeAll)
 	unknown := truePaths(ch.AfterUnknown)
 	sensB := truePaths(ch.BeforeSensitive)
 	sensA := truePaths(ch.AfterSensitive)
@@ -146,16 +186,26 @@ func diffResource(ch *ChangeRepr) []diffLine {
 			lines = append(lines, diffLine{sym: '~', text: "… (diff truncated)"})
 			break
 		}
+		// inside a collection that became unknown: reported once, at the collection
+		if par, ok := parentPath(k); ok && marked(unknown, par) {
+			continue
+		}
 		b, hasB := before[k]
 		a, hasA := after[k]
 		unk := unknown[k]
+		if !hasB && unk {
+			// a whole object/list that existed before is now unknown
+			if sub, ok := beforeAll[k]; ok {
+				b, hasB = sub, true
+			}
+		}
 
 		oldStr := renderVal(b)
 		newStr := renderVal(a)
-		if sensB[k] {
+		if marked(sensB, k) {
 			oldStr = "(sensitive)"
 		}
-		if sensA[k] {
+		if marked(sensA, k) {
 			newStr = "(sensitive)"
 		}
 		if unk {
@@ -166,9 +216,6 @@ func diffResource(ch *ChangeRepr) []diffLine {
 		case hasB && (hasA || unk):
 			if !unk && reflect.DeepEqual(a, b) {
 				continue // unchanged
-			}
-			if sensB[k] && sensA[k] && reflect.DeepEqual(a, b) {
-				continue
 			}
 			lines = append(lines, diffLine{sym: '~', key: k, old: oldStr, new: newStr, forces: forcesRepl(k)})
 		case !hasB && (hasA || unk):

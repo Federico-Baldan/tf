@@ -17,6 +17,7 @@ var valueFlags = map[string]bool{
 	"-var": true, "-var-file": true, "-target": true, "-exclude": true,
 	"-replace": true, "-out": true, "-backup": true, "-state": true,
 	"-state-out": true, "-lock-timeout": true, "-parallelism": true,
+	"-generate-config-out": true,
 }
 
 // flags that should also be passed to the apply-plan-file step

@@ -44,6 +44,29 @@ func truncRunes(s string, max int) string {
 	return string(r[:max-1]) + "…"
 }
 
+// wrapWords wraps one line at word boundaries to w cells, keeping its
+// leading indentation on continuation lines.
+func wrapWords(s string, w int) []string {
+	if w < 20 {
+		w = 20
+	}
+	indent := s[:len(s)-len(strings.TrimLeft(s, " \t"))]
+	line := indent
+	var out []string
+	for _, word := range strings.Fields(s) {
+		if strings.TrimSpace(line) != "" {
+			if len([]rune(line))+1+len([]rune(word)) > w {
+				out = append(out, line)
+				line = indent + word
+				continue
+			}
+			line += " "
+		}
+		line += word
+	}
+	return append(out, line)
+}
+
 func plural(n int, word string) string {
 	if n == 1 {
 		return fmt.Sprintf("%d %s", n, word)

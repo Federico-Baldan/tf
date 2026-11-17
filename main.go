@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/term"
@@ -59,21 +61,37 @@ func main() {
 		cfg.planPath = o.planOut
 		cfg.keepPlan = true
 	default:
-		cfg.planPath = filepath.Join(os.TempDir(), fmt.Sprintf("tf-pretty-%d.tfplan", os.Getpid()))
+		// plan files hold secrets in clear text: keep ours in a private (0700)
+		// directory, not under a guessable name in the shared temp dir
+		dir, err := os.MkdirTemp("", "tf-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "tf:", err)
+			os.Exit(1)
+		}
+		cfg.tmpDir = dir
+		cfg.planPath = filepath.Join(dir, "plan.tfplan")
+		// closing the terminal sends SIGHUP, which skips the normal cleanup
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			<-hup
+			_ = os.RemoveAll(dir)
+			os.Exit(129)
+		}()
 	}
 
 	m := newModel(cfg)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	finalModel, err := p.Run()
+	if cfg.tmpDir != "" {
+		_ = os.RemoveAll(cfg.tmpDir) // on every exit path, including errors
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "tf:", err)
 		os.Exit(1)
 	}
 
 	fm := finalModel.(model)
-	if !cfg.keepPlan {
-		_ = os.Remove(cfg.planPath)
-	}
 
 	for _, line := range fm.final {
 		fmt.Println(line)

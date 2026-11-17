@@ -7,6 +7,18 @@ type Plan struct {
 	ResourceChanges []*ResourceChange      `json:"resource_changes"`
 	OutputChanges   map[string]*ChangeRepr `json:"output_changes"`
 	ResourceDrift   []*ResourceChange      `json:"resource_drift"`
+	Applyable       bool                   `json:"applyable"` // false when there is nothing to apply
+}
+
+// drifted lists objects that changed outside terraform.
+func (p *Plan) drifted() []*ResourceChange {
+	var out []*ResourceChange
+	for _, rc := range p.ResourceDrift {
+		if actionOf(rc.Change.Actions) != actNoop {
+			out = append(out, rc)
+		}
+	}
+	return out
 }
 
 type ResourceChange struct {

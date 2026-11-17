@@ -48,6 +48,7 @@ type config struct {
 	sub      string // plan | apply | destroy
 	o        opts
 	planPath string
+	tmpDir   string // private dir holding our temporary plan file; removed on exit
 	keepPlan bool
 	skipPlan bool // apply was given an existing plan file
 }
@@ -393,7 +394,8 @@ func (m model) handleShow(msg showMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	if m.counts.total() == 0 && outputChanges == 0 {
+	// a -refresh-only plan has no resource changes, only drift to record in state
+	if m.counts.total() == 0 && outputChanges == 0 && !(m.plan.Applyable && len(m.plan.drifted()) > 0) {
 		m.final = append(m.final, stGreen.Render("✓ No changes. Infrastructure matches the configuration."))
 		m.appendDiagRecap()
 		m.quitting = true
@@ -593,16 +595,15 @@ func (m *model) rebuildRows() {
 	}
 
 	// drift section
-	drift := []*ResourceChange{}
-	for _, rc := range m.plan.ResourceDrift {
-		if actionOf(rc.Change.Actions) != actNoop {
-			drift = append(drift, rc)
-		}
-	}
+	drift := m.plan.drifted()
 	if len(drift) > 0 {
 		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: fmt.Sprintf("≠ drift detected outside terraform (%d)", len(drift)), nodeIdx: -1})
 		for _, rc := range drift {
-			m.rows = append(m.rows, row{kind: rowDetail, text: rc.Address, nodeIdx: -1, sym: '~'})
+			sym, what := byte('~'), "changed"
+			if actionOf(rc.Change.Actions) == actDelete {
+				sym, what = '-', "deleted"
+			}
+			m.rows = append(m.rows, row{kind: rowDetail, text: rc.Address + "  (" + what + ")", nodeIdx: -1, sym: sym})
 		}
 	}
 
@@ -844,6 +845,16 @@ func (m model) submitVar() (tea.Model, tea.Cmd) {
 
 // ---- recaps ----
 
+// refreshOnly reports whether the user asked for -refresh-only.
+func (m model) refreshOnly() bool {
+	for _, a := range m.cfg.o.planArgs {
+		if strings.TrimLeft(a, "-") == "refresh-only" {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *model) planRecap() {
 	c := m.counts
 	line := fmt.Sprintf("Plan: %d to add, %d to change, %d to destroy", c.add+c.replace, c.change, c.destroy+c.replace)
@@ -862,7 +873,7 @@ func (m *model) planRecap() {
 
 func (m *model) appendDiagRecap() {
 	for _, d := range m.diags {
-		m.final = append(m.final, renderDiagLines(d, m.width)...)
+		m.final = append(m.final, renderDiagLines(d, m.width, true)...)
 	}
 }
 

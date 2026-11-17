@@ -190,14 +190,17 @@ func (m model) viewDiags(max int) string {
 		b.WriteString(" " + stDim.Render(fmt.Sprintf("(%d earlier diagnostics)", start)) + "\n")
 	}
 	for _, d := range m.diags[start:] {
-		for _, line := range renderDiagLines(d, m.width) {
+		for _, line := range renderDiagLines(d, m.width, false) {
 			b.WriteString(" " + line + "\n")
 		}
 	}
 	return b.String()
 }
 
-func renderDiagLines(d *Diagnostic, width int) []string {
+// renderDiagLines formats a diagnostic. wrap=true word-wraps the detail (for
+// the recap printed after the TUI exits, where nothing may be cut off);
+// otherwise lines are truncated to fit the fixed-height screen.
+func renderDiagLines(d *Diagnostic, width int, wrap bool) []string {
 	mark := stRedBold.Render("✗ Error:")
 	body := stRed
 	if d.Severity == "warning" {
@@ -214,7 +217,13 @@ func renderDiagLines(d *Diagnostic, width int) []string {
 	lines := []string{head}
 	if d.Detail != "" {
 		for _, dl := range strings.Split(strings.TrimSpace(d.Detail), "\n") {
-			lines = append(lines, "    "+stDim.Render(truncRunes(dl, width-6)))
+			if !wrap {
+				lines = append(lines, "    "+stDim.Render(truncRunes(dl, width-6)))
+				continue
+			}
+			for _, wl := range wrapWords(dl, width-6) {
+				lines = append(lines, "    "+stDim.Render(wl))
+			}
 		}
 	}
 	return lines
@@ -233,6 +242,9 @@ func (m model) viewReview() string {
 	title := "Plan"
 	if m.cfg.sub == "destroy" {
 		title = "Destroy plan"
+	}
+	if m.refreshOnly() {
+		title = "Refresh-only plan"
 	}
 	parts := []string{}
 	if c.imports > 0 {

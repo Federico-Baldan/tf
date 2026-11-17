@@ -37,6 +37,8 @@ func actionGlyph(action string) (string, lipgloss.Style) {
 		return "→", stDim
 	case actForget:
 		return "⊘", stYellow
+	case actInvoke:
+		return "▶", stCyan
 	default:
 		return "·", stDim
 	}

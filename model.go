@@ -1,9 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -86,8 +90,9 @@ type row struct {
 
 // pendingVar is a required variable terraform reported as unset.
 type pendingVar struct {
-	name  string
-	where string // file:line of the declaration
+	name      string
+	where     string // file:line of the declaration
+	sensitive bool   // declared sensitive = true
 }
 
 type model struct {
@@ -110,6 +115,7 @@ type model struct {
 	refreshed   int
 	plannedSeen int
 	diags       []*Diagnostic
+	carried     []*Diagnostic // plan-phase warnings kept for the final recap
 	summary     *ChangeSummary
 	outputs     map[string]*OutputMeta
 
@@ -188,8 +194,11 @@ func (m model) startApplyCmd() tea.Cmd {
 	args = append(args, "apply", "-input=false", "-json")
 	args = append(args, m.cfg.o.shared...)
 	args = append(args, m.cfg.planPath)
+	// ephemeral variables must be given again when a saved plan is applied;
+	// the same values are ignored for ordinary variables
+	env := append(append([]string{}, m.cfg.o.varEnv...), m.vars...)
 	return func() tea.Msg {
-		if err := startTF(m.cfg.tfBin, args, "apply", nil, m.events, m.proc); err != nil {
+		if err := startTF(m.cfg.tfBin, args, "apply", env, m.events, m.proc); err != nil {
 			return exitMsg{phase: "apply", code: 1, err: err}
 		}
 		return nil
@@ -294,8 +303,8 @@ func (m *model) handleEvent(ev *Event) {
 				m.order = append(m.order, addr)
 				m.tasks[addr] = &task{addr: addr, action: ev.Hook.Action, status: taskFailed, start: time.Now(), doneAt: time.Now()}
 			}
-			if m.stage == stageApplying {
-				m.failed++
+			if m.stage == stageApplying && ev.Type == "apply_errored" {
+				m.failed++ // provision_errored is followed by apply_errored for the same resource
 			}
 		}
 	}
@@ -329,6 +338,7 @@ func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.final = append(m.final, stRedBold.Render("✗ Plan failed."))
 			}
+			m.appendStartErr(msg.err)
 			m.appendDiagRecap()
 			m.quitting = true
 			m.stage = stageDone
@@ -362,6 +372,9 @@ func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 					if s.Import > 0 {
 						imported = fmt.Sprintf(", %d imported", s.Import)
 					}
+					if s.ActionInvocation > 0 {
+						imported += fmt.Sprintf(", %d invoked", s.ActionInvocation)
+					}
 					m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Apply complete in %s — %d added, %d changed, %d destroyed%s.", fmtDur(elapsed), s.Add, s.Change, s.Remove, imported)))
 				} else {
 					m.final = append(m.final, stGreen.Render(fmt.Sprintf("✓ Apply complete in %s — %s.", fmtDur(elapsed), plural(m.completed, "resource"))))
@@ -369,10 +382,20 @@ func (m model) handleExit(msg exitMsg) (tea.Model, tea.Cmd) {
 				m.appendOutputsRecap()
 			}
 		}
+		m.appendStartErr(msg.err)
 		m.appendDiagRecap()
 		return m, tea.Quit
 	}
 	return m, nil
+}
+
+// appendStartErr explains a failure that produced no diagnostics because
+// terraform never ran (bad TF_BIN, not executable...).
+func (m *model) appendStartErr(err error) {
+	var ee *exec.ExitError
+	if err != nil && len(m.diags) == 0 && !errors.As(err, &ee) {
+		m.final = append(m.final, stRed.Render(err.Error()))
+	}
 }
 
 func (m model) handleShow(msg showMsg) (tea.Model, tea.Cmd) {
@@ -394,8 +417,8 @@ func (m model) handleShow(msg showMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// a -refresh-only plan has no resource changes, only drift to record in state
-	if m.counts.total() == 0 && outputChanges == 0 && !(m.plan.Applyable && len(m.plan.drifted()) > 0) {
+	// applyable also covers what the counts can't see: refresh-only drift, actions
+	if m.counts.total() == 0 && outputChanges == 0 && !m.plan.Applyable {
 		m.final = append(m.final, stGreen.Render("✓ No changes. Infrastructure matches the configuration."))
 		m.appendDiagRecap()
 		m.quitting = true
@@ -417,6 +440,11 @@ func (m model) beginApply() (tea.Model, tea.Cmd) {
 	m.completed, m.failed = 0, 0
 	m.total = m.counts.hooks()
 	m.startedAt = time.Now()
+	for _, d := range m.diags { // plan-phase warnings (deprecations...) would otherwise be lost
+		if d.Severity == "warning" {
+			m.carried = append(m.carried, d)
+		}
+	}
 	m.diags = nil
 	return m, tea.Batch(m.startApplyCmd(), waitFor(m.events), tickCmd())
 }
@@ -473,6 +501,8 @@ func sectionTitle(action string, n int) string {
 		return fmt.Sprintf("⊘ forget — leaves state, resource kept (%d)", n)
 	case actMove:
 		return fmt.Sprintf("→ move (%d)", n)
+	case actInvoke:
+		return fmt.Sprintf("▶ invoke (%d)", n)
 	}
 	return action
 }
@@ -483,6 +513,9 @@ func noteOf(rc *ResourceChange, action string) string {
 	var parts []string
 	if r := prettifyReason(rc.ActionReason); r != "" && action != actForget {
 		parts = append(parts, r)
+	}
+	if len(rc.Change.Actions) == 2 && slices.Contains(rc.Change.Actions, "forget") {
+		parts = append(parts, "old object forgotten, not destroyed")
 	}
 	if im := rc.Change.Importing; im != nil && im.ID != "" {
 		if action == actImport {
@@ -543,6 +576,14 @@ func (m *model) rebuildRows() {
 		}
 	}
 
+	// actions to run
+	if n := len(m.plan.ActionInvocations); n > 0 {
+		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: sectionTitle(actInvoke, n), nodeIdx: -1, action: actInvoke})
+		for _, ai := range m.plan.ActionInvocations {
+			m.rows = append(m.rows, row{kind: rowDetail, text: ai.Address, nodeIdx: -1, sym: ' '})
+		}
+	}
+
 	// outputs section
 	if len(m.plan.OutputChanges) > 0 {
 		names := make([]string, 0, len(m.plan.OutputChanges))
@@ -573,8 +614,10 @@ func (m *model) rebuildRows() {
 					sym = '-'
 				}
 				oldStr, newStr := renderVal(ch.Before), renderVal(ch.After)
-				if truePaths(ch.AfterUnknown)[""] {
+				if u := truePaths(ch.AfterUnknown); u[""] {
 					newStr = "(known after apply)"
+				} else if len(u) > 0 {
+					newStr += " (partly known after apply)"
 				}
 				if b, ok := ch.AfterSensitive.(bool); ok && b {
 					newStr = "(sensitive)"
@@ -661,8 +704,8 @@ func (m *model) toggleAt(cursor int) {
 		return
 	}
 	r := m.rows[cursor]
-	if r.nodeIdx < 0 {
-		return
+	if r.kind == rowBlank || r.nodeIdx < 0 {
+		return // blank rows carry no node (their zero nodeIdx would open node 0)
 	}
 	n := m.nodes[r.nodeIdx]
 	n.expanded = !n.expanded
@@ -783,17 +826,51 @@ func (m model) unsetVars() []pendingVar {
 		pv := pendingVar{name: sm[1]}
 		if d.Range != nil {
 			pv.where = fmt.Sprintf("%s:%d", d.Range.Filename, d.Range.Start.Line)
+			pv.sensitive = declSensitive(m.chdir(), d.Range.Filename, d.Range.Start.Line)
 		}
 		out = append(out, pv)
 	}
 	return out
 }
 
-var secretNameRe = regexp.MustCompile(`(?i)pass|secret|token|key|cred|auth`)
+var secretNameRe = regexp.MustCompile(`(?i)pass|pw|secret|token|key|cred|auth`)
+var sensitiveDeclRe = regexp.MustCompile(`\bsensitive\s*=\s*true\b`)
 
-// masked reports whether the typed value should be hidden. terraform doesn't
-// tell us which variables are sensitive, so go by the name.
-func (v pendingVar) masked() bool { return secretNameRe.MatchString(v.name) }
+// masked reports whether the typed value should be hidden: the variable is
+// declared sensitive (as terraform's own prompt checks), or its name looks
+// secret when the declaration can't be read.
+func (v pendingVar) masked() bool { return v.sensitive || secretNameRe.MatchString(v.name) }
+
+// chdir is the directory given with the global -chdir= option, if any.
+func (m model) chdir() string {
+	for _, g := range m.cfg.o.globals {
+		if dir, ok := strings.CutPrefix(g, "-chdir="); ok {
+			return dir
+		}
+	}
+	return ""
+}
+
+// declSensitive reports whether the variable block starting at file:line has
+// sensitive = true. terraform's diagnostics don't say.
+func declSensitive(dir, file string, line int) bool {
+	b, err := os.ReadFile(filepath.Join(dir, file))
+	if err != nil || line < 1 {
+		return false
+	}
+	lines := strings.Split(string(b), "\n")
+	var blk strings.Builder
+	depth, opened := 0, false
+	for i := line - 1; i < len(lines) && i < line+199; i++ {
+		blk.WriteString(lines[i] + "\n")
+		depth += strings.Count(lines[i], "{") - strings.Count(lines[i], "}")
+		opened = opened || strings.Contains(lines[i], "{")
+		if opened && depth <= 0 {
+			break
+		}
+	}
+	return sensitiveDeclRe.MatchString(blk.String())
+}
 
 func (m model) handlePromptKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch k.Type {
@@ -805,10 +882,7 @@ func (m model) handlePromptKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.stage, m.quitting = stageDone, true
 		return m, tea.Quit
 	case tea.KeyEnter:
-		if m.input == "" {
-			return m, nil
-		}
-		return m.submitVar()
+		return m.submitVar() // empty is a valid value, as in terraform's own prompt
 	case tea.KeyBackspace:
 		if r := []rune(m.input); len(r) > 0 {
 			m.input = string(r[:len(r)-1])
@@ -872,7 +946,13 @@ func (m *model) planRecap() {
 }
 
 func (m *model) appendDiagRecap() {
-	for _, d := range m.diags {
+	seen := map[string]bool{} // terraform repeats some warnings at apply
+	for _, d := range append(append([]*Diagnostic{}, m.carried...), m.diags...) {
+		key := d.Severity + "|" + d.Summary + "|" + d.Detail
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		m.final = append(m.final, renderDiagLines(d, m.width, true)...)
 	}
 }

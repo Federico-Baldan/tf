@@ -91,6 +91,16 @@ func marked(set map[string]bool, path string) bool {
 	return false
 }
 
+// anyUnder reports whether path itself or anything inside it is flagged.
+func anyUnder(set map[string]bool, path string) bool {
+	for p := range set {
+		if p == path || strings.HasPrefix(p, path+".") || strings.HasPrefix(p, path+"[") {
+			return true
+		}
+	}
+	return false
+}
+
 // truePaths collects paths whose leaf value is `true` (used for
 // after_unknown and *_sensitive structures).
 func truePaths(v any) map[string]bool {
@@ -193,16 +203,18 @@ func diffResource(ch *ChangeRepr) []diffLine {
 		b, hasB := before[k]
 		a, hasA := after[k]
 		unk := unknown[k]
+		hidden := false // old value contains something sensitive
 		if !hasB && unk {
 			// a whole object/list that existed before is now unknown
 			if sub, ok := beforeAll[k]; ok {
 				b, hasB = sub, true
+				hidden = anyUnder(sensB, k)
 			}
 		}
 
 		oldStr := renderVal(b)
 		newStr := renderVal(a)
-		if marked(sensB, k) {
+		if hidden || marked(sensB, k) {
 			oldStr = "(sensitive)"
 		}
 		if marked(sensA, k) {

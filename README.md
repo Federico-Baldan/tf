@@ -33,15 +33,16 @@ plan from `terraform show -json` instead of scraping text, and renders:
 - **Progress headline** — progress bar, `done/total`, percent, active count,
   per-resource timing, and a naive ETA from the observed completion rate.
 - **Collapsible plan tree** — resources grouped into
-  `＋ create / ～ update / ± replace / － destroy` (plus `↓ import`, `→ move`
-  and `⊘ forget` for state-only changes), collapsed to just names by default. Expand any resource for an attribute-level diff: `old → new`,
+  `＋ create / ～ update / ± replace / － destroy` (plus `↓ import`, `→ move`,
+  `⊘ forget`, and `▶ invoke` for actions), collapsed to just names by
+  default. Expand any resource for an attribute-level diff: `old → new`,
   `(known after apply)`, `(sensitive)`, and `# forces replacement` flags.
   Output changes and detected drift get their own sections.
 - **Missing variables, asked for** — if a required variable has no value,
   `tf` prompts for it instead of failing, then re-runs the plan. Values go
   to terraform through `TF_VAR_*` (never the process list); strings are taken
-  as typed, lists and maps as HCL. Names that look secret (`password`,
-  `token`, `key`…) are hidden as you type.
+  as typed, lists and maps as HCL. Variables declared
+  `sensitive = true` (and secret-looking names) are hidden as you type.
 - **A real approval gate** — for `apply`/`destroy` the plan tree *is* the
   confirmation prompt. Review, then press `a` `y`. Destroys get a red
   warning with the count.

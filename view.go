@@ -250,6 +250,9 @@ func (m model) viewReview() string {
 	if c.imports > 0 {
 		parts = append(parts, stCyan.Render(fmt.Sprintf("↓%d import", c.imports)))
 	}
+	if c.invokes > 0 {
+		parts = append(parts, stCyan.Render(fmt.Sprintf("▶%d invoke", c.invokes)))
+	}
 	if c.add > 0 {
 		parts = append(parts, stGreen.Render(fmt.Sprintf("+%d add", c.add)))
 	}

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -85,6 +86,9 @@ func startTF(bin string, args []string, phase string, env []string, ch chan tea.
 				ch <- evMsg{ev}
 			}
 		}
+		// a line over the buffer stops the scanner; keep draining so terraform
+		// never blocks on a full pipe
+		_, _ = io.Copy(io.Discard, stdout)
 		werr := cmd.Wait()
 		code := 0
 		if werr != nil {

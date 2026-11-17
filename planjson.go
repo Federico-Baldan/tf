@@ -1,5 +1,7 @@
 package main
 
+import "slices"
+
 // Structures for `terraform show -json <planfile>` output. Only the fields
 // the review tree needs.
 
@@ -8,6 +10,12 @@ type Plan struct {
 	OutputChanges   map[string]*ChangeRepr `json:"output_changes"`
 	ResourceDrift   []*ResourceChange      `json:"resource_drift"`
 	Applyable       bool                   `json:"applyable"` // false when there is nothing to apply
+	// actions (terraform 1.14+) to run on apply, e.g. via -invoke
+	ActionInvocations []*ActionInvocation `json:"action_invocations"`
+}
+
+type ActionInvocation struct {
+	Address string `json:"address"`
 }
 
 // drifted lists objects that changed outside terraform.
@@ -54,10 +62,16 @@ const (
 	// Pseudo-actions: terraform reports these as "no-op" plus a side marker.
 	actImport = "import"
 	actMove   = "move"
+	actInvoke = "invoke" // action block run on apply
 )
 
 func actionOf(actions []string) string {
 	if len(actions) == 2 {
+		// lifecycle { destroy = false } makes a "replace" that forgets the old
+		// object instead of destroying it: that's a create, not a delete+create
+		if slices.Contains(actions, "forget") {
+			return actCreate
+		}
 		return actReplace
 	}
 	if len(actions) == 1 {
@@ -90,6 +104,8 @@ type planCounts struct {
 	add, change, destroy, replace int
 	imports                       int // objects adopted by import blocks, whatever else changes
 	stateOnly                     int // import-only, move and forget entries
+	reads                         int // data sources read during apply
+	invokes                       int // actions to run
 }
 
 func countPlan(p *Plan) planCounts {
@@ -109,18 +125,22 @@ func countPlan(p *Plan) planCounts {
 			c.replace++
 		case actImport, actMove, actForget:
 			c.stateOnly++
+		case actRead:
+			c.reads++
 		}
 	}
+	c.invokes = len(p.ActionInvocations)
 	return c
 }
 
 // total is everything worth reviewing and applying.
 func (c planCounts) total() int {
-	return c.add + c.change + c.destroy + c.replace + c.stateOnly
+	return c.add + c.change + c.destroy + c.replace + c.stateOnly + c.invokes
 }
 
 // hooks is how many apply start/complete pairs terraform will emit. A
-// replace runs twice (delete, then create); state-only changes run none.
+// replace runs twice (delete, then create), a data read once; state-only
+// changes run none.
 func (c planCounts) hooks() int {
-	return c.add + c.change + c.destroy + 2*c.replace
+	return c.add + c.change + c.destroy + 2*c.replace + c.reads
 }

@@ -45,11 +45,13 @@ type DiagRange struct {
 }
 
 type ChangeSummary struct {
-	Add       int    `json:"add"`
-	Change    int    `json:"change"`
-	Import    int    `json:"import"`
-	Remove    int    `json:"remove"`
-	Operation string `json:"operation"`
+	Add    int `json:"add"`
+	Change int `json:"change"`
+	Import int `json:"import"`
+	// actions run during apply
+	ActionInvocation int    `json:"action_invocation"`
+	Remove           int    `json:"remove"`
+	Operation        string `json:"operation"`
 }
 
 type OutputMeta struct {

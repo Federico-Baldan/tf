@@ -81,8 +81,18 @@ func main() {
 	}
 
 	m := newModel(cfg)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	// route SIGINT/SIGTERM through the same path as ctrl+c, so terraform is
+	// stopped gracefully instead of being orphaned when tf exits
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithoutSignalHandler())
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for range stop {
+			p.Send(tea.KeyMsg{Type: tea.KeyCtrlC})
+		}
+	}()
 	finalModel, err := p.Run()
+	signal.Stop(stop)
 	if cfg.tmpDir != "" {
 		_ = os.RemoveAll(cfg.tmpDir) // on every exit path, including errors
 	}

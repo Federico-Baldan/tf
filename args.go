@@ -5,6 +5,7 @@ import "strings"
 type opts struct {
 	sub         string
 	globals     []string // args before the subcommand (e.g. -chdir=...)
+	varEnv      []string // -var values as TF_VAR_* entries, replayed at apply (ephemeral variables need them there too)
 	planArgs    []string // flags passed to the plan step
 	shared      []string // flags passed to both plan and apply steps
 	autoApprove bool
@@ -17,7 +18,7 @@ var valueFlags = map[string]bool{
 	"-var": true, "-var-file": true, "-target": true, "-exclude": true,
 	"-replace": true, "-out": true, "-backup": true, "-state": true,
 	"-state-out": true, "-lock-timeout": true, "-parallelism": true,
-	"-generate-config-out": true,
+	"-generate-config-out": true, "-invoke": true,
 }
 
 // flags that should also be passed to the apply-plan-file step
@@ -54,6 +55,12 @@ func parseArgs(sub string, rest []string) opts {
 			i++
 			val = rest[i]
 			tokens = append(tokens, val)
+		}
+
+		if name == "-var" {
+			if k, v, ok := strings.Cut(val, "="); ok {
+				o.varEnv = append(o.varEnv, "TF_VAR_"+k+"="+v)
+			}
 		}
 
 		switch {

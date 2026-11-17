@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -19,8 +21,11 @@ const planFixture = `{"resource_changes":[
  {"address":"t.imp_only","change":{"actions":["no-op"],"importing":{"id":"1"}}},
  {"address":"t.imp_update","change":{"actions":["update"],"importing":{"id":"2"}}},
  {"address":"t.moved","previous_address":"t.old","change":{"actions":["no-op"]}},
- {"address":"t.forgotten","change":{"actions":["forget"]}}
-]}`
+ {"address":"t.forgotten","change":{"actions":["forget"]}},
+ {"address":"t.fcreate","change":{"actions":["forget","create"]}},
+ {"address":"t.cbd","change":{"actions":["create","forget"]}},
+ {"address":"t.read","change":{"actions":["read"]}}
+],"action_invocations":[{"address":"action.x.y"}]}`
 
 func TestKindAndCounts(t *testing.T) {
 	var p Plan
@@ -31,6 +36,8 @@ func TestKindAndCounts(t *testing.T) {
 		"t.create": actCreate, "t.update": actUpdate, "t.replace": actReplace,
 		"t.delete": actDelete, "t.noop": actNoop, "t.imp_only": actImport,
 		"t.imp_update": actUpdate, "t.moved": actMove, "t.forgotten": actForget,
+		// lifecycle { destroy = false } replaces: the old object is forgotten, not destroyed
+		"t.fcreate": actCreate, "t.cbd": actCreate, "t.read": actRead,
 	}
 	for _, rc := range p.ResourceChanges {
 		if got := kindOf(rc); got != want[rc.Address] {
@@ -39,15 +46,15 @@ func TestKindAndCounts(t *testing.T) {
 	}
 	c := countPlan(&p)
 	// imp_update counts as a change; imp_only, moved and forgotten are state-only
-	wantC := planCounts{add: 1, change: 2, destroy: 1, replace: 1, imports: 2, stateOnly: 3}
+	wantC := planCounts{add: 3, change: 2, destroy: 1, replace: 1, imports: 2, stateOnly: 3, reads: 1, invokes: 1}
 	if c != wantC {
 		t.Errorf("counts %+v, want %+v", c, wantC)
 	}
-	if c.total() != 8 {
-		t.Errorf("total %d, want 8", c.total())
+	if c.total() != 11 { // 3+2+1+1 changes, 3 state-only, 1 action
+		t.Errorf("total %d, want 11", c.total())
 	}
-	if c.hooks() != 6 { // replace emits delete + create
-		t.Errorf("hooks %d, want 6", c.hooks())
+	if c.hooks() != 9 { // replace emits delete + create, a deferred read one pair
+		t.Errorf("hooks %d, want 9", c.hooks())
 	}
 }
 
@@ -62,6 +69,10 @@ func TestNoteOf(t *testing.T) {
 	f := &ResourceChange{Address: "t.f", ActionReason: "delete_because_no_resource_config", Change: &ChangeRepr{}}
 	if got := noteOf(f, actForget); got != "" {
 		t.Errorf("forget should carry no delete reason, got %q", got)
+	}
+	fc := &ResourceChange{Address: "t.fc", Change: &ChangeRepr{Actions: []string{"forget", "create"}}}
+	if got := noteOf(fc, actCreate); got != "old object forgotten, not destroyed" {
+		t.Errorf("got %q", got)
 	}
 }
 
@@ -96,10 +107,14 @@ func TestUnsetVars(t *testing.T) {
 }
 
 func TestMasked(t *testing.T) {
-	for name, want := range map[string]bool{"db_password": true, "api_token": true, "ssh_key": true, "env": false, "region": false} {
+	for name, want := range map[string]bool{"db_password": true, "db_pwd": true, "api_token": true, "ssh_key": true, "env": false, "region": false} {
 		if got := (pendingVar{name: name}).masked(); got != want {
 			t.Errorf("%s: masked %v, want %v", name, got, want)
 		}
+	}
+	// declared sensitive wins over the name
+	if !(pendingVar{name: "region", sensitive: true}).masked() {
+		t.Error("sensitive declaration must mask")
 	}
 }
 
@@ -227,5 +242,104 @@ func TestDriftedRefreshOnly(t *testing.T) {
 	}
 	if d := p.drifted(); !p.Applyable || len(d) != 1 || d[0].Address != "a" {
 		t.Errorf("drifted %+v applyable %v", d, p.Applyable)
+	}
+}
+
+// the old value of a collection that turns unknown must not reveal a
+// sensitive element inside it
+func TestSensitiveInsideCollapsedCollection(t *testing.T) {
+	got := diffOf(t, `{"actions":["update"],
+		"before":{"input":{"pw":"TOPSECRET","b":"x"}},"after":{},
+		"before_sensitive":{"input":{"pw":true}},
+		"after_unknown":{"input":true}}`)
+	if len(got) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	if strings.Contains(got[0].old, "TOPSECRET") || got[0].old != "(sensitive)" {
+		t.Errorf("leaked: %+v", got[0])
+	}
+}
+
+func TestVarEnv(t *testing.T) {
+	o := parseArgs("apply", []string{"-var", "a=1", "-var=b=c=d", "-var-file=x.tfvars"})
+	if want := []string{"TF_VAR_a=1", "TF_VAR_b=c=d"}; !reflect.DeepEqual(o.varEnv, want) {
+		t.Errorf("varEnv %v, want %v", o.varEnv, want)
+	}
+	if o := parseArgs("plan", []string{"-invoke", "action.a.b"}); !reflect.DeepEqual(o.planArgs, []string{"-invoke", "action.a.b"}) {
+		t.Errorf("-invoke value detached: %v", o.planArgs)
+	}
+}
+
+func TestDeclSensitive(t *testing.T) {
+	dir := t.TempDir()
+	tf := `variable "plain" {
+  type = string
+}
+
+variable "hidden" {
+  type = string
+  validation {
+    condition     = length(var.hidden) > 0
+    error_message = "x"
+  }
+  sensitive = true
+}
+
+variable "inline" { sensitive = true }
+`
+	if err := os.WriteFile(filepath.Join(dir, "variables.tf"), []byte(tf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for line, want := range map[int]bool{1: false, 5: true, 14: true} {
+		if got := declSensitive(dir, "variables.tf", line); got != want {
+			t.Errorf("line %d: got %v, want %v", line, got, want)
+		}
+	}
+	if declSensitive(dir, "missing.tf", 1) {
+		t.Error("unreadable file must not claim sensitive")
+	}
+}
+
+// the plan's warnings survive into the recap after apply, without duplicates
+func TestRecapKeepsPlanWarnings(t *testing.T) {
+	w := &Diagnostic{Severity: "warning", Summary: "Deprecated", Detail: "old"}
+	dup := &Diagnostic{Severity: "warning", Summary: "Deprecated", Detail: "old"}
+	e := &Diagnostic{Severity: "error", Summary: "Boom"}
+	m := model{width: 80, carried: []*Diagnostic{w}, diags: []*Diagnostic{dup, e}}
+	m.appendDiagRecap()
+	var warnings, errs int
+	for _, l := range m.final {
+		warnings += strings.Count(l, "Warning:")
+		errs += strings.Count(l, "Error:")
+	}
+	if warnings != 1 || errs != 1 {
+		t.Errorf("warnings=%d errors=%d, lines=%q", warnings, errs, m.final)
+	}
+}
+
+// enter/space on a blank separator row used to open node 0 (or panic with no nodes)
+func TestToggleOnBlankRow(t *testing.T) {
+	m := model{rows: []row{{kind: rowBlank}, {kind: rowSection, nodeIdx: -1}}}
+	m.toggleAt(0)
+	m.toggleAt(1)
+	m.nodes = []*node{{addr: "a"}}
+	m.rows = []row{{kind: rowBlank}, {kind: rowNode, nodeIdx: 0}}
+	m.plan = &Plan{}
+	m.toggleAt(0)
+	if m.nodes[0].expanded {
+		t.Error("blank row toggled node 0")
+	}
+}
+
+func TestStartErrShown(t *testing.T) {
+	m := model{}
+	m.appendStartErr(os.ErrNotExist)
+	if len(m.final) != 1 {
+		t.Fatalf("final %q", m.final)
+	}
+	m = model{diags: []*Diagnostic{{Severity: "error"}}}
+	m.appendStartErr(os.ErrNotExist)
+	if len(m.final) != 0 {
+		t.Error("must not add noise when terraform produced diagnostics")
 	}
 }

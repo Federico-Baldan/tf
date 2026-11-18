@@ -3,25 +3,33 @@ name: release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: # fallback: `gh workflow run release.yml --ref v0.2.0` if the tag push doesn't trigger it
+  # Manual runs: from a tag it publishes the release (use it if the tag push
+  # doesn't trigger this workflow: `gh workflow run release.yml --ref v0.2.0`);
+  # with dry_run it builds everything and publishes nothing.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build only, publish nothing (goreleaser --snapshot --skip=publish)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
   goreleaser:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04 # pinned, see ci.yml
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
-          args: release --clean
+          args: release --clean${{ inputs.dry_run && ' --snapshot --skip=publish' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}

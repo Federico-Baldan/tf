@@ -62,6 +62,9 @@ go install github.com/Federico-Baldan/tf@latest
 or grab a binary from [releases](https://github.com/Federico-Baldan/tf/releases),
 or build from source with `make install`.
 
+`go install` and `make install` need Go 1.27.4 or newer. An older `go`
+downloads it itself (`GOTOOLCHAIN=auto`, the default).
+
 `tf` invokes whatever `terraform` is on your `PATH`. Point it elsewhere with
 `TF_BIN` — OpenTofu works too: `TF_BIN=tofu tf plan`.
 

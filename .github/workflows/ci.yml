@@ -8,10 +8,12 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Pinned to the newest image so a future ubuntu-latest switch can't turn an
+    # unrelated change red. Bump this deliberately.
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - run: go build ./...

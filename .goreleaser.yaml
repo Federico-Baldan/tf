@@ -26,6 +26,8 @@ checksum:
 
 changelog:
   use: github
+  # The default prints "Name <email>" when it can't resolve a GitHub username.
+  format: "{{ .SHA }}: {{ .Message }} ({{ with .AuthorUsername }}@{{ . }}{{ else }}{{ .AuthorName }}{{ end }})"
   sort: asc
   filters:
     exclude:

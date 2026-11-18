@@ -1,8 +1,9 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"reflect"
 	"regexp"
@@ -97,6 +98,9 @@ func parentPath(p string) (string, bool) {
 // terraform flags a whole sensitive or unknown collection once, at the
 // collection itself, not on each element inside it.
 func marked(set map[string]bool, path string) bool {
+	if len(set) == 0 {
+		return false
+	}
 	for p, ok := path, true; ok; p, ok = parentPath(p) {
 		if set[p] {
 			return true
@@ -135,14 +139,16 @@ func renderVal(v any) string {
 	if v == nil {
 		return "null"
 	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(v); err != nil {
+	b, err := jsonv2.Marshal(v, valJSON)
+	if err != nil {
 		return fmt.Sprintf("%v", v)
 	}
-	return truncRunes(clean(strings.TrimSuffix(buf.String(), "\n")), maxDiffValueLen)
+	return truncRunes(clean(string(b)), maxDiffValueLen)
 }
+
+// valJSON is encoding/json without HTML escaping, the same as an Encoder
+// after SetEscapeHTML(false), but built once instead of per value.
+var valJSON = jsonv2.JoinOptions(json.DefaultOptionsV1(), jsontext.EscapeForHTML(false))
 
 // replacePathPrefixes converts terraform's replace_paths (a list of steps:
 // strings are keys, numbers are indexes) to our path form.

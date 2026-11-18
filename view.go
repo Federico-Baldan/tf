@@ -204,7 +204,7 @@ func renderDiagLines(d *Diagnostic, width int, full bool) []string {
 	}
 	lines := []string{head}
 	if d.Detail != "" {
-		for _, dl := range strings.Split(strings.TrimSpace(clean(d.Detail)), "\n") {
+		for dl := range strings.SplitSeq(strings.TrimSpace(clean(d.Detail)), "\n") {
 			if !full {
 				dl = truncRunes(dl, width-6)
 			}

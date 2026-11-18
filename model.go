@@ -541,17 +541,17 @@ func (m *model) rebuildRows() {
 			if last != "" {
 				m.rows = append(m.rows, row{kind: rowBlank})
 			}
-			m.rows = append(m.rows, row{kind: rowSection, diffLine: diffLine{text: sectionTitle(n.action, counts[n.action])}, nodeIdx: -1, action: n.action})
+			m.rows = append(m.rows, row{kind: rowSection, text: sectionTitle(n.action, counts[n.action]), nodeIdx: -1, action: n.action})
 			last = n.action
 		}
 		caret := "▸"
 		if n.expanded {
 			caret = "▾"
 		}
-		m.rows = append(m.rows, row{kind: rowNode, diffLine: diffLine{text: caret + " " + n.addr}, note: n.reason, nodeIdx: i, action: n.action})
+		m.rows = append(m.rows, row{kind: rowNode, text: caret + " " + n.addr, note: n.reason, nodeIdx: i, action: n.action})
 		if n.expanded {
 			if len(n.detail) == 0 {
-				m.rows = append(m.rows, row{kind: rowDetail, diffLine: diffLine{text: "(no attribute changes)", sym: ' '}, nodeIdx: i})
+				m.rows = append(m.rows, row{kind: rowDetail, text: "(no attribute changes)", sym: ' ', nodeIdx: i})
 			}
 			kw := keyWidth(n.detail)
 			for _, d := range n.detail {
@@ -562,9 +562,9 @@ func (m *model) rebuildRows() {
 
 	// actions to run
 	if n := len(m.plan.ActionInvocations); n > 0 {
-		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, diffLine: diffLine{text: sectionTitle(actInvoke, n)}, nodeIdx: -1, action: actInvoke})
+		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: sectionTitle(actInvoke, n), nodeIdx: -1, action: actInvoke})
 		for _, ai := range m.plan.ActionInvocations {
-			m.rows = append(m.rows, row{kind: rowDetail, diffLine: diffLine{text: clean(ai.Address), sym: ' '}, nodeIdx: -1})
+			m.rows = append(m.rows, row{kind: rowDetail, text: clean(ai.Address), sym: ' ', nodeIdx: -1})
 		}
 	}
 
@@ -578,7 +578,7 @@ func (m *model) rebuildRows() {
 		}
 		if len(names) > 0 {
 			sort.Strings(names)
-			m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, diffLine: diffLine{text: fmt.Sprintf("⇒ outputs (%d)", len(names))}, nodeIdx: -1})
+			m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: fmt.Sprintf("⇒ outputs (%d)", len(names)), nodeIdx: -1})
 			var lines []diffLine
 			for _, name := range names {
 				ch := m.plan.OutputChanges[name]
@@ -620,13 +620,13 @@ func (m *model) rebuildRows() {
 	// drift section
 	drift := m.plan.drifted()
 	if len(drift) > 0 {
-		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, diffLine: diffLine{text: fmt.Sprintf("≠ drift detected outside terraform (%d)", len(drift))}, nodeIdx: -1})
+		m.rows = append(m.rows, row{kind: rowBlank}, row{kind: rowSection, text: fmt.Sprintf("≠ drift detected outside terraform (%d)", len(drift)), nodeIdx: -1})
 		for _, rc := range drift {
 			sym, what := byte('~'), "changed"
 			if actionOf(rc.Change.Actions) == actDelete {
 				sym, what = '-', "deleted"
 			}
-			m.rows = append(m.rows, row{kind: rowDetail, diffLine: diffLine{text: clean(rc.Address) + "  (" + what + ")", sym: sym}, nodeIdx: -1})
+			m.rows = append(m.rows, row{kind: rowDetail, text: clean(rc.Address) + "  (" + what + ")", sym: sym, nodeIdx: -1})
 		}
 	}
 

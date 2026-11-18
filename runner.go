@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -120,11 +119,8 @@ func runShowCmd(bin string, globals []string, planPath string) tea.Cmd {
 			}
 			return showMsg{err: errors.New(detail)}
 		}
-		var p Plan
-		if err := json.Unmarshal(out, &p); err != nil {
-			return showMsg{err: err}
-		}
-		return showMsg{plan: &p}
+		p, err := parsePlan(out)
+		return showMsg{plan: p, err: err}
 	}
 }
 
